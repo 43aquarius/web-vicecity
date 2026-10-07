@@ -39,6 +39,16 @@ interface FileEntry {
   refFilename: string
 }
 
+/** Serialisable flat index: [path, dataOffset, compressedSize] per file. */
+export interface PackedIndex {
+  v: number
+  size: number
+  files: number
+  folders: number
+  totalCompressed: number
+  entries: Array<[string, number, number]>
+}
+
 export interface ArchiveStats {
   folders: number
   files: number
@@ -310,6 +320,32 @@ export class PackedArchive {
   listFiles(folder?: string): string[] {
     if (folder) return this.folders.get(folder) ?? []
     return [...this.entries.keys()]
+  }
+
+  /**
+   * Flat, JSON-serialisable index of every servable path.
+   *
+   * References and folder copies are resolved away, so the loader (server
+   * RemoteArchive or the browser Service Worker) can serve any path with a
+   * plain table lookup: entries[path] → [dataOffset, compressedSize] inside
+   * the archive byte stream.
+   */
+  dumpIndex(): PackedIndex {
+    const entries: Array<[string, number, number]> = []
+    for (const [path, e] of this.entries) {
+      const resolved = e.fileType === FILE_TYPE_CONTENT ? e : this.resolve(path)
+      if (resolved && resolved.fileType === FILE_TYPE_CONTENT) {
+        entries.push([path, resolved.dataOffset, resolved.compressedSize])
+      }
+    }
+    return {
+      v: 1,
+      size: this.stats.archiveSize,
+      files: entries.length,
+      folders: this.stats.folders,
+      totalCompressed: this.stats.totalCompressed,
+      entries,
+    }
   }
 
   listFolders(): string[] {

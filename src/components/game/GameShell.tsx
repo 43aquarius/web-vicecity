@@ -43,6 +43,15 @@ export default function GameShell() {
   useEffect(() => {
     const body = document.body
 
+    // Register the archive Service Worker: it serves /vcsky and /vcbr
+    // requests directly from the static mirror (browser-side ranged reads +
+    // WASM brotli), falling back to the server proxy. see public/sw.js.
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker
+        .register('/sw.js')
+        .catch((err) => console.warn('[sw] registration failed:', err))
+    }
+
     // Initial touch-state machine attributes (the engine mutates these later).
     const stateDefaults: Record<string, string> = {
       'data-is-touch': '0',

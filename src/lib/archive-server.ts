@@ -8,9 +8,22 @@
  */
 
 import { createWriteStream, statSync, mkdirSync } from 'node:fs'
-import { mkdir } from 'node:fs/promises'
+import { mkdir, readFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
-import { PackedArchive } from './packed-archive'
+import { PackedArchive, type ArchiveStats } from './packed-archive'
+import { RemoteArchive } from './remote-archive'
+
+/**
+ * Common serving surface for local (PackedArchive) and remote (RemoteArchive)
+ * backends — serveFromArchive and the materialisation cache are agnostic.
+ */
+export interface ArchiveSource {
+  readonly stats: ArchiveStats
+  resolve(path: string): { dataOffset: number; compressedSize: number } | null
+  streamRaw(path: string): ReadableStream<Uint8Array> | null
+  streamDecompressed(path: string): ReadableStream<Uint8Array> | null
+  close(): Promise<void>
+}
 
 export const ARCHIVE_URL =
   process.env.REVCDOS_ARCHIVE_URL ?? 'https://folder.morgen.qzz.io/revcdos.bin'
@@ -40,10 +53,43 @@ function resolveArchivePath(): string {
 
 export const ARCHIVE_PATH = resolveArchivePath()
 
+/**
+ * Locate the bundled flat index (dumped by scripts/dump-archive-index.ts,
+ * ~1.8 MB). It ships with the app under public/game/, so published
+ * containers can serve archive files without holding the 1.08 GB archive.
+ */
+function resolveIndexPath(): string | null {
+  if (process.env.REVCDOS_INDEX_PATH) return process.env.REVCDOS_INDEX_PATH
+  const candidates = [
+    `${process.cwd()}/public/game/revcdos-index.json`,
+    '/home/z/my-project/public/game/revcdos-index.json',
+  ]
+  for (const candidate of candidates) {
+    try {
+      if (statSync(candidate).size > 0) return candidate
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return null
+}
+
+/** Read just the `size` field of a flat index file (integrity checks). */
+async function indexSize(indexPath: string): Promise<number> {
+  try {
+    const idx = JSON.parse(await readFile(indexPath, 'utf-8')) as { size?: number }
+    return idx.size ?? 0
+  } catch {
+    return 0
+  }
+}
+
 export type ArchiveState = 'idle' | 'downloading' | 'indexing' | 'ready' | 'error'
 
 export interface ArchiveStatus {
   state: ArchiveState
+  /** 'local' = read off the local archive file; 'remote' = ranged reads from upstream. */
+  mode?: 'local' | 'remote'
   downloaded: number
   total: number
   progress: number // 0..100
@@ -70,11 +116,11 @@ const status: ArchiveStatus = {
  * created by the OLD module (whose class shape may lack new methods). Bump
  * this constant whenever PackedArchive's public API changes.
  */
-const ARCHIVE_INSTANCE_VERSION = 2
+const ARCHIVE_INSTANCE_VERSION = 3
 
 interface ArchiveGlobal {
-  archive?: PackedArchive | null
-  initPromise?: Promise<PackedArchive> | null
+  archive?: ArchiveSource | null
+  initPromise?: Promise<ArchiveSource> | null
   status?: ArchiveStatus
   version?: number
 }
@@ -94,7 +140,7 @@ function setStatus(patch: Partial<ArchiveStatus>): void {
 }
 
 /** Get (and lazily initialize) the archive. Concurrent callers share one promise. */
-export function getArchive(): Promise<PackedArchive> {
+export function getArchive(): Promise<ArchiveSource> {
   const store = g.__revcdosArchive!
   // Hot-reload guard: drop instances created by an older module shape.
   if (store.archive && store.version !== ARCHIVE_INSTANCE_VERSION) {
@@ -138,59 +184,102 @@ async function fileSize(path: string): Promise<number> {
   }
 }
 
-async function init(): Promise<PackedArchive> {
-  console.log('[archive] init: starting')
-  await mkdir(dirname(ARCHIVE_PATH), { recursive: true })
-  const s = g.__revcdosArchive!.status!
-
-  // The expected size always comes from the remote archive — a local partial
-  // file must never be mistaken for a complete one.
-  s.total = await probeRemoteSize()
-  console.log(`[archive] init: expected total ${s.total}`)
-
-  // Download with resume until the local file is complete.
-  for (let attempt = 1; ; attempt++) {
-    const local = await fileSize(ARCHIVE_PATH)
-    const total = s.total
-
-    if (local >= total && total > 0) break
-    if (local > 0 && local < total) {
-      // A partial file can only be resumed when the server supports ranges.
-      if (!(await remoteSupportsRange())) {
-        await import('node:fs/promises').then((fsp) => fsp.rm(ARCHIVE_PATH, { force: true }))
-      }
-    }
-
-    s.state = 'downloading'
-    s.downloaded = local
-    s.progress = total > 0 ? Math.floor((local / total) * 100) : 0
-
-    try {
-      await downloadWithResume(local, total)
-    } catch (err) {
-      if (attempt >= 10) throw err
-      console.error(`[archive] download attempt ${attempt} failed, retrying:`, err)
-      await new Promise((r) => setTimeout(r, 2000))
-    }
-  }
-
-  // Build the index.
-  s.state = 'indexing'
-  s.downloaded = await fileSize(ARCHIVE_PATH)
-  s.progress = 100
-  console.log('[archive] init: building index')
-  const arc = new PackedArchive(ARCHIVE_PATH)
-  await arc.init()
-
+function finishReady(arc: ArchiveSource, mode: 'local' | 'remote', s: ArchiveStatus): ArchiveSource {
   s.state = 'ready'
+  s.mode = mode
   s.files = arc.stats.files
   s.folders = arc.stats.folders
+  s.total = arc.stats.archiveSize
+  s.progress = 100
+  s.downloaded = mode === 'local' ? arc.stats.archiveSize : 0
   s.error = undefined
   g.__revcdosArchive!.archive = arc
   console.log(
-    `[archive] ready: ${s.files} files, ${s.folders} folders, ${(arc.stats.archiveSize / 1024 / 1024).toFixed(1)} MB`,
+    `[archive] ready (${mode}): ${s.files} files, ${s.folders} folders, ${(arc.stats.archiveSize / 1024 / 1024).toFixed(1)} MB`,
   )
   return arc
+}
+
+async function init(): Promise<ArchiveSource> {
+  console.log('[archive] init: starting')
+  const s = g.__revcdosArchive!.status!
+  const indexPath = resolveIndexPath()
+
+  // ---- Mode A: complete local archive (dev sandbox / persistent volume) ----
+  // A partial leftover (e.g. a download truncated by a storage quota) must
+  // never be treated as complete, so verify against the bundled index size.
+  const localSize = await fileSize(ARCHIVE_PATH)
+  if (localSize > 0) {
+    const expected = indexPath ? await indexSize(indexPath) : 0
+    if (expected === 0 || localSize === expected) {
+      s.state = 'indexing'
+      s.total = localSize
+      s.downloaded = localSize
+      s.progress = 100
+      const arc = new PackedArchive(ARCHIVE_PATH)
+      await arc.init()
+      return finishReady(arc, 'local', s)
+    }
+    console.warn(
+      `[archive] init: local file is partial (${localSize}/${expected}) — not usable in local mode`,
+    )
+  }
+
+  // ---- Mode B: explicit download request (REVCDOS_DOWNLOAD=1) ----
+  // Legacy behaviour for hosts with ample disk that want zero upstream
+  // latency: fetch the full archive with resume support, then go local.
+  if (process.env.REVCDOS_DOWNLOAD === '1') {
+    await mkdir(dirname(ARCHIVE_PATH), { recursive: true })
+    const idxSz = indexPath ? await indexSize(indexPath) : 0
+    s.total = idxSz > 0 ? idxSz : await probeRemoteSize()
+    console.log(`[archive] init: expected total ${s.total}`)
+
+    for (let attempt = 1; ; attempt++) {
+      const local = await fileSize(ARCHIVE_PATH)
+      const total = s.total
+
+      if (local >= total && total > 0) break
+      if (local > 0 && local < total) {
+        if (!(await remoteSupportsRange())) {
+          await import('node:fs/promises').then((fsp) => fsp.rm(ARCHIVE_PATH, { force: true }))
+        }
+      }
+
+      s.state = 'downloading'
+      s.mode = undefined
+      s.downloaded = local
+      s.progress = total > 0 ? Math.floor((local / total) * 100) : 0
+
+      try {
+        await downloadWithResume(local, total)
+      } catch (err) {
+        if (attempt >= 10) throw err
+        console.error(`[archive] download attempt ${attempt} failed, retrying:`, err)
+        await new Promise((r) => setTimeout(r, 2000))
+      }
+    }
+
+    s.state = 'indexing'
+    s.downloaded = await fileSize(ARCHIVE_PATH)
+    s.progress = 100
+    const arc = new PackedArchive(ARCHIVE_PATH)
+    await arc.init()
+    return finishReady(arc, 'local', s)
+  }
+
+  // ---- Mode C (default): remote ranged reads — zero disk, zero boot traffic ----
+  // Small published containers cannot hold the 1.08 GB archive; instead every
+  // asset request fetches just its byte range from upstream (with a raw-bytes
+  // LRU so hot files are shared across players).
+  if (!indexPath) {
+    throw new Error(
+      'No local archive and no bundled index (public/game/revcdos-index.json); set REVCDOS_DOWNLOAD=1 to download the archive at boot',
+    )
+  }
+  s.state = 'indexing'
+  const arc = new RemoteArchive(indexPath, ARCHIVE_URL)
+  await arc.init()
+  return finishReady(arc, 'remote', s)
 }
 
 async function probeRemoteSize(): Promise<number> {
@@ -306,7 +395,7 @@ if (!mg.__revcdosMaterialized) {
   mg.__revcdosMaterialized = { lru: new Map(), inflight: new Map() }
 }
 
-function getMaterialized(arc: PackedArchive, entryPath: string): Promise<Uint8Array> {
+function getMaterialized(arc: ArchiveSource, entryPath: string): Promise<Uint8Array> {
   const store = mg.__revcdosMaterialized!
   const cached = store.lru.get(entryPath)
   if (cached) {
@@ -330,7 +419,7 @@ function getMaterialized(arc: PackedArchive, entryPath: string): Promise<Uint8Ar
 }
 
 async function materialize(
-  arc: PackedArchive,
+  arc: ArchiveSource,
   entryPath: string,
   store: MaterializedGlobal,
 ): Promise<Uint8Array> {
@@ -386,7 +475,7 @@ export async function serveFromArchive(
   entryPath: string,
   request: Request,
 ): Promise<Response> {
-  let arc: PackedArchive
+  let arc: ArchiveSource
   try {
     arc = await getArchive()
   } catch (err) {
@@ -488,7 +577,7 @@ let activeDecompress = 0
 const decompressQueue: (() => void)[] = []
 
 async function acquireDecompressSlot(
-  arc: PackedArchive,
+  arc: ArchiveSource,
   entryPath: string,
 ): Promise<ReadableStream<Uint8Array> | null> {
   if (activeDecompress >= MAX_CONCURRENT_DECOMPRESS) {

@@ -8,7 +8,8 @@
 
 - **免安装直玩**：打开页面 → 点击开始 → 进入 1986 年的罪恶都市
 - **完整的游戏体验**：主线剧情、电台音乐、过场动画全部可用（引擎为 DOSZone 的 Emscripten 移植）
-- **服务端归档直读**：1.08 GB packed 游戏归档（28,912 个文件）由 Node 按字节偏移流式提供，不在浏览器占用整包内存
+- **双通道资源加载**：浏览器 Service Worker 直连静态镜像（GitHub raw 分片 Range 直读 + WASM brotli 解压 + 浏览器缓存）；镜像异常时自动回退服务器代理，永不断流
+- **服务器零磁盘占用（默认）**：服务端不再下载 1.08 GB 归档——内置扁平索引（1.8 MB，31,227 个文件偏移表），资产请求实时从上游拉取对应字节段
 - **分片断点续传**：游戏数据以 4 MB 分片下载，单片失败自动重试，抗代理掐流
 - **浏览器缓存秒开**：约 130 MB 引擎数据首次下载后写入 Cache API，之后再次进入秒级加载
 - **移动端适配**：触屏虚拟按键、刘海屏安全区、竖屏旋转提示、触控目标 ≥ 50px
@@ -18,19 +19,23 @@
 
 ```
 浏览器
-  │  Emscripten 引擎 (WebGL + OpenAL)          public/game/*
-  │  4MB Range 分片下载 / 探针 / 多级回退        game.js
+  │  Emscripten 引擎 (WebGL + OpenAL)              public/game/*
+  │  Service Worker: 索引查表 → GitHub raw 分片    public/sw.js
+  │  Range 直读 → WASM brotli 解压 → Cache 缓存     public/game/brotli-dec.js
   ▼
-Next.js API 路由 (Node runtime)
-  │  /vcsky/[...path]  /vcbr/[...path]          src/app/vcsky | vcbr
-  │  三模式响应: 206 分片 / br 直通 / 流式解压    src/lib/archive-server.ts
-  │  packed 归档: ULEB128 索引 + brotli 内容     src/lib/packed-archive.ts
+静态镜像（archive-data 分支，12 × 96MB 分片）      gh push 分片
+  revcdos.bin = 拼接全部分片（1.08 GB，28,912 文件）
+
+回退通道（镜像故障/CDN 异常时）：
+浏览器 → 服务器代理 → 上游归档实时 Range 拉取
+  │  /vcsky/[...path]  /vcbr/[...path]              src/app/vcsky | vcbr
+  │  三模式: 206 分片 / br 直通 / 流式解压           src/lib/archive-server.ts
+  │  扁平索引 + 远程 Range 读取器（零磁盘）           src/lib/remote-archive.ts
   ▼
-revcdos.bin (1.08 GB, 28,912 文件, 10 文件夹)
-  ▲ 首次运行自动从上游 CDN 下载（支持断点续传、失败重试）
+https://folder.morgen.qzz.io/revcdos.bin (上游，支持 Range)
 ```
 
-游戏本体（`public/game/`）来自 reVCDOS 上游发行包：js-dos v8 引擎模块链 + 启动器。服务端以 `--packed` 模式工作（与上游 Docker 推荐方案一致），按需从归档读取任意游戏资产（模型 `.dff`、音效 `.raw`、贴图等）。
+游戏本体（`public/game/`）来自 reVCDOS 上游发行包：js-dos v8 引擎模块链 + 启动器。归档索引（`public/game/revcdos-index.json`）由 `scripts/dump-archive-index.ts` 从归档生成，记录每个文件的字节偏移与压缩长度——浏览器 SW 与服务器远程模式共用同一份索引。
 
 ## 快速开始
 
@@ -48,8 +53,10 @@ bun run dev        # http://localhost:3000
 | 变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `REVCDOS_ARCHIVE_URL` | `https://folder.morgen.qzz.io/revcdos.bin` | 归档下载源（支持 HTTP Range 的任意镜像） |
-| `REVCDOS_ARCHIVE_PATH` | `.revcdos-cache/revcdos.bin`（回退 `/tmp`） | 本地归档存放路径，建议指向持久卷 |
-| `REVCDOS_PRELOAD` | 未设置 | 设为 `1` 时服务器启动即预热归档；小内存容器**不要开启** |
+| `REVCDOS_ARCHIVE_PATH` | `.revcdos-cache/revcdos.bin`（回退 `/tmp`） | 本地归档路径；存在且完整时自动走本地模式（秒级索引） |
+| `REVCDOS_DOWNLOAD` | 未设置 | 设为 `1` 时启动后自动下载全量归档（大磁盘环境优化） |
+| `REVCDOS_INDEX_PATH` | `public/game/revcdos-index.json` | 扁平索引文件路径（远程模式依赖） |
+| `REVCDOS_PRELOAD` | 未设置 | 设为 `1` 时启动即预热（默认懒加载，首位访客触发） |
 | `DATABASE_URL` | — | 可选，Prisma SQLite 连接串（模板遗留，游戏本身不依赖） |
 
 ## 部署
@@ -61,6 +68,8 @@ bun run build     # next build + 组装 .next/standalone
 bun run start     # NODE_ENV=production bun .next/standalone/server.js
 ```
 
+**三种服务端模式（自动选择）**：本地归档完整 → **local**（直接读盘，最快）；无本地归档 → **remote**（内置索引 + 实时 Range 拉取上游，零磁盘，适合小容器）；`REVCDOS_DOWNLOAD=1` → 先下载再 local。
+
 **资源要求**：
 
 - 磁盘 ≥ 2.5 GB（归档 1.08 GB + 构建产物），内存 ≥ 1 GB（推荐 2 GB）
@@ -68,8 +77,9 @@ bun run start     # NODE_ENV=production bun .next/standalone/server.js
 
 **冷启动行为（重要）**：
 
-- 默认懒加载：服务器启动本身是轻量的，第一位访客打开页面时才开始拉取归档（页面有进度提示，`game.js` 会轮询等待归档就绪后再下载数据）
-- 如果部署在小规格容器（内存 < 1 GB / 磁盘紧张），请保持默认懒加载模式，避免 `REVCDOS_PRELOAD=1`（启动即拉 1 GB 会把小容器直接打挂）
+- 默认零磁盘：无本地归档时自动进入远程模式（秒级就绪，无需下载 1 GB）
+- 浏览器优先直连静态镜像（archive-data 分片），服务器只在镜像异常时才被使用
+- 小规格容器可放心部署；大磁盘环境想极致低延迟再设 `REVCDOS_DOWNLOAD=1`
 - 建议把 `REVCDOS_ARCHIVE_PATH` 指向持久卷上的路径，容器重启/重新部署后无需重新下载
 - 上游 CDN 带宽有限时，可在自有对象存储/CDN 放一份 `revcdos.bin` 并通过 `REVCDOS_ARCHIVE_URL` 指向它
 
