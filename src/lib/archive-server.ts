@@ -1,0 +1,597 @@
+/**
+ * Archive server singleton.
+ *
+ * Mirrors reVCDOS `server.py --packed` mode: ensures the packed game archive
+ * (revcdos.bin) is available locally (downloading it with resume support when
+ * missing), builds the file index, and exposes helpers used by the
+ * /vcsky and /vcbr route handlers.
+ */
+
+import { createWriteStream, statSync, mkdirSync } from 'node:fs'
+import { mkdir } from 'node:fs/promises'
+import { dirname } from 'node:path'
+import { PackedArchive } from './packed-archive'
+
+export const ARCHIVE_URL =
+  process.env.REVCDOS_ARCHIVE_URL ?? 'https://folder.morgen.qzz.io/revcdos.bin'
+
+/**
+ * Resolve the local archive path with fallbacks so the server also boots in
+ * environments where the project directory is absent or read-only (e.g. a
+ * published container with a different filesystem layout).
+ */
+function resolveArchivePath(): string {
+  if (process.env.REVCDOS_ARCHIVE_PATH) return process.env.REVCDOS_ARCHIVE_PATH
+  const candidates = [
+    '/home/z/my-project/.revcdos-cache/revcdos.bin',
+    `${process.cwd()}/.revcdos-cache/revcdos.bin`,
+    '/tmp/revcdos-cache/revcdos.bin',
+  ]
+  for (const candidate of candidates) {
+    try {
+      mkdirSync(dirname(candidate), { recursive: true })
+      return candidate
+    } catch {
+      /* try the next candidate */
+    }
+  }
+  return candidates[candidates.length - 1]
+}
+
+export const ARCHIVE_PATH = resolveArchivePath()
+
+export type ArchiveState = 'idle' | 'downloading' | 'indexing' | 'ready' | 'error'
+
+export interface ArchiveStatus {
+  state: ArchiveState
+  downloaded: number
+  total: number
+  progress: number // 0..100
+  files: number
+  folders: number
+  error?: string
+}
+
+const status: ArchiveStatus = {
+  state: 'idle',
+  downloaded: 0,
+  total: 0,
+  progress: 0,
+  files: 0,
+  folders: 0,
+}
+
+/**
+ * Singleton storage on globalThis — Turbopack dev re-instantiates modules per
+ * route graph, so plain module state is NOT shared between route handlers.
+ *
+ * ARCHIVE_INSTANCE_VERSION guards against a subtler dev-mode trap: after a
+ * hot reload the NEW module code must not keep using a PackedArchive instance
+ * created by the OLD module (whose class shape may lack new methods). Bump
+ * this constant whenever PackedArchive's public API changes.
+ */
+const ARCHIVE_INSTANCE_VERSION = 2
+
+interface ArchiveGlobal {
+  archive?: PackedArchive | null
+  initPromise?: Promise<PackedArchive> | null
+  status?: ArchiveStatus
+  version?: number
+}
+const g = globalThis as typeof globalThis & { __revcdosArchive?: ArchiveGlobal }
+if (!g.__revcdosArchive) {
+  g.__revcdosArchive = { archive: null, initPromise: null, status, version: ARCHIVE_INSTANCE_VERSION }
+}
+
+export function getArchiveStatus(): ArchiveStatus {
+  const s = g.__revcdosArchive?.status ?? status
+  return { ...s }
+}
+
+function setStatus(patch: Partial<ArchiveStatus>): void {
+  const s = g.__revcdosArchive?.status ?? status
+  Object.assign(s, patch)
+}
+
+/** Get (and lazily initialize) the archive. Concurrent callers share one promise. */
+export function getArchive(): Promise<PackedArchive> {
+  const store = g.__revcdosArchive!
+  // Hot-reload guard: drop instances created by an older module shape.
+  if (store.archive && store.version !== ARCHIVE_INSTANCE_VERSION) {
+    const stale = store.archive
+    store.archive = null
+    store.initPromise = null
+    store.version = ARCHIVE_INSTANCE_VERSION
+    // Plain Uint8Array cache entries stay valid across reloads, but drop any
+    // in-flight materialisations started against the stale instance.
+    const mstore = mg.__revcdosMaterialized
+    if (mstore) mstore.inflight.clear()
+    stale.close().catch(() => {})
+    console.log('[archive] module reloaded — rebuilding archive instance')
+  }
+  if (!store.version) store.version = ARCHIVE_INSTANCE_VERSION
+  if (!store.initPromise) {
+    store.initPromise = init().catch((err) => {
+      // Allow a later retry after a failed initialization.
+      store.initPromise = null
+      const s = store.status!
+      s.state = 'error'
+      s.error = err instanceof Error ? err.message : String(err)
+      throw err
+    })
+  }
+  return store.initPromise
+}
+
+/** Fire-and-forget preparation (used by instrumentation + landing page). */
+export function prepareArchive(): void {
+  getArchive().catch((err) => {
+    console.error('[archive] preparation failed:', err)
+  })
+}
+
+async function fileSize(path: string): Promise<number> {
+  try {
+    return statSync(path).size
+  } catch {
+    return 0
+  }
+}
+
+async function init(): Promise<PackedArchive> {
+  console.log('[archive] init: starting')
+  await mkdir(dirname(ARCHIVE_PATH), { recursive: true })
+  const s = g.__revcdosArchive!.status!
+
+  // The expected size always comes from the remote archive — a local partial
+  // file must never be mistaken for a complete one.
+  s.total = await probeRemoteSize()
+  console.log(`[archive] init: expected total ${s.total}`)
+
+  // Download with resume until the local file is complete.
+  for (let attempt = 1; ; attempt++) {
+    const local = await fileSize(ARCHIVE_PATH)
+    const total = s.total
+
+    if (local >= total && total > 0) break
+    if (local > 0 && local < total) {
+      // A partial file can only be resumed when the server supports ranges.
+      if (!(await remoteSupportsRange())) {
+        await import('node:fs/promises').then((fsp) => fsp.rm(ARCHIVE_PATH, { force: true }))
+      }
+    }
+
+    s.state = 'downloading'
+    s.downloaded = local
+    s.progress = total > 0 ? Math.floor((local / total) * 100) : 0
+
+    try {
+      await downloadWithResume(local, total)
+    } catch (err) {
+      if (attempt >= 10) throw err
+      console.error(`[archive] download attempt ${attempt} failed, retrying:`, err)
+      await new Promise((r) => setTimeout(r, 2000))
+    }
+  }
+
+  // Build the index.
+  s.state = 'indexing'
+  s.downloaded = await fileSize(ARCHIVE_PATH)
+  s.progress = 100
+  console.log('[archive] init: building index')
+  const arc = new PackedArchive(ARCHIVE_PATH)
+  await arc.init()
+
+  s.state = 'ready'
+  s.files = arc.stats.files
+  s.folders = arc.stats.folders
+  s.error = undefined
+  g.__revcdosArchive!.archive = arc
+  console.log(
+    `[archive] ready: ${s.files} files, ${s.folders} folders, ${(arc.stats.archiveSize / 1024 / 1024).toFixed(1)} MB`,
+  )
+  return arc
+}
+
+async function probeRemoteSize(): Promise<number> {
+  // A Range GET (rather than HEAD) survives CDN header normalization and
+  // reports the total size via Content-Range. Always drain the tiny body via
+  // arrayBuffer() — body.cancel() can hang under some fetch implementations.
+  const res = await fetch(ARCHIVE_URL, {
+    headers: { Range: 'bytes=0-0' },
+    signal: AbortSignal.timeout(30_000),
+  })
+  if (!res.ok && res.status !== 206) {
+    throw new Error(`Probe ${ARCHIVE_URL} -> ${res.status}`)
+  }
+  await res.arrayBuffer().catch(() => {})
+  if (res.status === 206) {
+    const contentRange = res.headers.get('content-range') ?? ''
+    const total = Number(contentRange.split('/')[1] ?? 0)
+    if (total > 0) return total
+  }
+  const len = Number(res.headers.get('content-length') ?? 0)
+  if (len > 1) return len
+  throw new Error('Remote archive size unknown')
+}
+
+async function remoteSupportsRange(): Promise<boolean> {
+  try {
+    const res = await fetch(ARCHIVE_URL, {
+      headers: { Range: 'bytes=0-0' },
+      signal: AbortSignal.timeout(30_000),
+    })
+    const ok = res.status === 206
+    await res.arrayBuffer().catch(() => {})
+    return ok
+  } catch {
+    return false
+  }
+}
+
+async function downloadWithResume(from: number, _total: number): Promise<void> {
+  // NOTE: do NOT set Accept-Encoding: identity — the CDN ignores Range
+  // headers for identity requests. undici's default works (206 responses).
+  const headers: Record<string, string> = {}
+  if (from > 0) headers.Range = `bytes=${from}-`
+
+  const res = await fetch(ARCHIVE_URL, {
+    headers,
+    signal: AbortSignal.timeout(3_600_000),
+  })
+  if (!res.ok && res.status !== 206) {
+    throw new Error(`Download failed: HTTP ${res.status}`)
+  }
+  let startOffset = from
+  if (from > 0 && res.status !== 206) {
+    // Server ignored the Range header; restart from zero.
+    startOffset = 0
+  }
+
+  if (!res.body) throw new Error('Empty download body')
+
+  const ws = createWriteStream(ARCHIVE_PATH, { flags: startOffset > 0 ? 'a' : 'w' })
+  await pipeTo(res.body as unknown as ReadableStream<Uint8Array>, ws, startOffset)
+}
+
+async function pipeTo(
+  body: ReadableStream<Uint8Array>,
+  ws: import('node:fs').WriteStream,
+  startOffset: number,
+): Promise<void> {
+  const reader = body.getReader()
+  let received = startOffset
+  const s = g.__revcdosArchive!.status!
+  const write = (chunk: Buffer) =>
+    new Promise<void>((resolve, reject) => {
+      ws.write(chunk, (err) => (err ? reject(err) : resolve()))
+    })
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      await write(Buffer.from(value))
+      received += value.length
+      s.downloaded = received
+      if (s.total > 0) {
+        s.progress = Math.min(100, Math.floor((received / s.total) * 100))
+      }
+    }
+    await new Promise<void>((resolve, reject) => {
+      ws.on('error', reject)
+      ws.end(() => resolve())
+    })
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+/**
+ * Materialised (decompressed) view of archive files for ranged serving.
+ *
+ * Files are stream-decompressed ONCE on their first ranged request and kept
+ * in an LRU cache capped at MAX_MATERIALIZED_BYTES. The data package is
+ * ~135 MB decompressed and the wasm ~8 MB, so both fit comfortably while the
+ * total stays bounded regardless of request patterns.
+ */
+const MAX_MATERIALIZED_BYTES = 320 * 1024 * 1024
+
+interface MaterializedGlobal {
+  lru: Map<string, Uint8Array>
+  inflight: Map<string, Promise<Uint8Array>>
+}
+
+const mg = globalThis as typeof globalThis & { __revcdosMaterialized?: MaterializedGlobal }
+if (!mg.__revcdosMaterialized) {
+  mg.__revcdosMaterialized = { lru: new Map(), inflight: new Map() }
+}
+
+function getMaterialized(arc: PackedArchive, entryPath: string): Promise<Uint8Array> {
+  const store = mg.__revcdosMaterialized!
+  const cached = store.lru.get(entryPath)
+  if (cached) {
+    // Refresh LRU recency.
+    store.lru.delete(entryPath)
+    store.lru.set(entryPath, cached)
+    return Promise.resolve(cached)
+  }
+  let inflight = store.inflight.get(entryPath)
+  if (!inflight) {
+    inflight = materialize(arc, entryPath, store)
+    store.inflight.set(entryPath, inflight)
+    inflight
+      .catch(() => {})
+      .finally(() => {
+        store.inflight.delete(entryPath)
+      })
+      .catch(() => {})
+  }
+  return inflight
+}
+
+async function materialize(
+  arc: PackedArchive,
+  entryPath: string,
+  store: MaterializedGlobal,
+): Promise<Uint8Array> {
+  const stream = arc.streamDecompressed(entryPath)
+  if (!stream) throw new Error(`File not found: ${entryPath}`)
+  const reader = stream.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    chunks.push(value)
+    total += value.length
+  }
+  const out = new Uint8Array(total)
+  let pos = 0
+  for (const chunk of chunks) {
+    out.set(chunk, pos)
+    pos += chunk.length
+  }
+  store.lru.set(entryPath, out)
+  // Evict least-recently-used entries while over the budget (never the file
+  // that was just materialised — it is the most recent one).
+  let used = 0
+  for (const buf of store.lru.values()) used += buf.length
+  while (used > MAX_MATERIALIZED_BYTES && store.lru.size > 1) {
+    const oldest = store.lru.keys().next().value
+    if (oldest === undefined) break
+    const buf = store.lru.get(oldest)
+    store.lru.delete(oldest)
+    used -= buf ? buf.length : 0
+  }
+  return out
+}
+
+/**
+ * Serve helper shared by /vcsky and /vcbr route handlers.
+ *
+ * Response modes:
+ *   1. `Range: bytes=…` → 206 slices of the DECOMPRESSED content, served from
+ *      a bounded LRU materialisation cache (decompressed once per file).
+ *      Clients assemble chunks of the final content — every response is
+ *      small enough for any intermediary (CDN / function-compute edge) to
+ *      carry, and each chunk is independently retryable.
+ *   2. `Accept-Encoding: br` → 200 passthrough of the stored brotli bytes
+ *      (streamed straight off disk, near-zero memory).
+ *   3. otherwise → 200 STREAMING server-side decompression (bounded memory,
+ *      a few pipe buffers) instead of the previous whole-file sync
+ *      `brotliDecompressSync` which spiked ~600 MB RSS for the 60 MB data
+ *      package and could OOM the container.
+ */
+export async function serveFromArchive(
+  entryPath: string,
+  request: Request,
+): Promise<Response> {
+  let arc: PackedArchive
+  try {
+    arc = await getArchive()
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err)
+    return new Response(`Archive unavailable: ${message}`, { status: 503 })
+  }
+
+  const entry = arc.resolve(entryPath)
+  if (!entry) {
+    return new Response(`File not found in archive: ${entryPath}`, { status: 404 })
+  }
+
+  const mediaType = getMediaType(entryPath)
+  const isHead = request.method === 'HEAD'
+
+  const baseHeaders: Record<string, string> = {
+    'Content-Type': mediaType,
+    'Cache-Control': 'public, max-age=86400',
+    'Accept-Ranges': 'bytes',
+    'X-ReVCDOS-Source': 'packed-archive',
+    // Match the upstream reVCDOS response headers.
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Embedder-Policy': 'require-corp',
+  }
+
+  // ---- Mode 1: HTTP Range → slices of the DECOMPRESSED content, 206 ----
+  // The first ranged request materialises (stream-decompresses) the file once
+  // into a bounded LRU cache; subsequent chunks are served as instant slices
+  // of the final content, so every response is small enough for any proxy to
+  // carry, works in every browser (no client-side decompression needed) and
+  // is individually retryable — the properties that make the chunked game
+  // download resilient against edges that truncate long streams.
+  const rangeHeader = request.headers.get('range')
+  if (rangeHeader) {
+    let data: Uint8Array
+    try {
+      data = await getMaterialized(arc, entryPath)
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return new Response(`Failed to prepare file: ${message}`, { status: 500 })
+    }
+    const range = parseRange(rangeHeader, data.length)
+    if (!range) {
+      const headers = new Headers({
+        ...baseHeaders,
+        'Cache-Control': 'no-store',
+        'Content-Range': `bytes */${data.length}`,
+      })
+      return new Response(null, { status: 416, headers })
+    }
+    const [start, end] = range
+    const length = end - start + 1
+    const headers = new Headers({
+      ...baseHeaders,
+      // Partial responses must not be cached by shared intermediaries —
+      // they are reassembled by the client and cached via the Cache API.
+      'Cache-Control': 'no-store',
+      'Content-Range': `bytes ${start}-${end}/${data.length}`,
+      'Content-Length': String(length),
+    })
+    if (isHead) return new Response(null, { status: 206, headers })
+    return new Response(data.subarray(start, end + 1), { status: 206, headers })
+  }
+
+  // ---- Mode 2: brotli passthrough ----
+  const acceptEncoding = (request.headers.get('accept-encoding') ?? '').toLowerCase()
+  const acceptsBr = acceptEncoding.includes('br')
+  if (acceptsBr) {
+    const headers = new Headers({
+      ...baseHeaders,
+      'Content-Encoding': 'br',
+      'Content-Length': String(entry.compressedSize),
+    })
+    if (isHead) return new Response(null, { status: 200, headers })
+    const stream = arc.streamRaw(entryPath)
+    if (!stream) return new Response('File not found', { status: 404 })
+    return new Response(stream, { status: 200, headers })
+  }
+
+  // ---- Mode 3: streaming decompression (bounded memory) ----
+  if (isHead) {
+    const headers = new Headers({ ...baseHeaders })
+    return new Response(null, { status: 200, headers })
+  }
+  const decompressed = await acquireDecompressSlot(arc, entryPath)
+  if (decompressed === null) return new Response('File not found', { status: 404 })
+  // No Content-Length (chunked transfer) — the decompressed size is unknown
+  // upfront and materialising it would defeat the bounded-memory goal.
+  const headers = new Headers({ ...baseHeaders })
+  return new Response(decompressed, { status: 200, headers })
+}
+
+/**
+ * Cap concurrent streaming decompressions so a burst of requests from a
+ * proxy that strips Accept-Encoding cannot fan out into unbounded memory.
+ */
+const MAX_CONCURRENT_DECOMPRESS = 12
+let activeDecompress = 0
+const decompressQueue: (() => void)[] = []
+
+async function acquireDecompressSlot(
+  arc: PackedArchive,
+  entryPath: string,
+): Promise<ReadableStream<Uint8Array> | null> {
+  if (activeDecompress >= MAX_CONCURRENT_DECOMPRESS) {
+    await new Promise<void>((resolve) => decompressQueue.push(resolve))
+  }
+  activeDecompress++
+  const stream = arc.streamDecompressed(entryPath)
+  if (!stream) {
+    activeDecompress--
+    const next = decompressQueue.shift()
+    if (next) next()
+    return null
+  }
+  const reader = stream.getReader()
+  const release = () => {
+    activeDecompress--
+    const next = decompressQueue.shift()
+    if (next) next()
+  }
+  // Release the slot when the stream finishes OR errors OR is cancelled.
+  const wrapped = new ReadableStream<Uint8Array>({
+    start(controller) {
+      const pump = (): Promise<void> =>
+        reader
+          .read()
+          .then(({ done, value }) => {
+            if (done) {
+              release()
+              controller.close()
+              return
+            }
+            controller.enqueue(value)
+            return pump()
+          })
+          .catch((err: unknown) => {
+            release()
+            try {
+              controller.error(err)
+            } catch {
+              /* already closed */
+            }
+          })
+      pump()
+    },
+    cancel(reason) {
+      release()
+      return reader.cancel(reason)
+    },
+  })
+  return wrapped
+}
+
+/** Parse a single-range `bytes=` header against a resource of `size` bytes. */
+function parseRange(
+  header: string,
+  size: number,
+): [start: number, end: number] | null {
+  const match = /^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$/.exec(header)
+  if (!match) return null
+  const [, startStr, endStr] = match
+  if (startStr === '' && endStr === '') return null
+  let start: number
+  let end: number
+  if (startStr === '') {
+    // suffix-length form: bytes=-N → last N bytes
+    const suffix = Number(endStr)
+    if (suffix <= 0) return null
+    start = Math.max(0, size - suffix)
+    end = size - 1
+  } else {
+    start = Number(startStr)
+    end = endStr === '' ? size - 1 : Number(endStr)
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end < start) {
+    return null
+  }
+  if (start >= size) return null // unsatisfiable
+  end = Math.min(end, size - 1)
+  return [start, end]
+}
+
+function getMediaType(path: string): string {
+  const lower = path.toLowerCase()
+  if (lower.endsWith('.wasm.br')) return 'application/wasm'
+  if (lower.endsWith('.js.br')) return 'application/javascript'
+  if (lower.endsWith('.json.br')) return 'application/json'
+  if (lower.endsWith('.html.br')) return 'text/html'
+  if (lower.endsWith('.css.br')) return 'text/css'
+  if (lower.endsWith('.br')) return 'application/octet-stream'
+  if (lower.endsWith('.wasm')) return 'application/wasm'
+  if (lower.endsWith('.js')) return 'application/javascript'
+  if (lower.endsWith('.json')) return 'application/json'
+  if (lower.endsWith('.html')) return 'text/html'
+  if (lower.endsWith('.css')) return 'text/css'
+  if (lower.endsWith('.png')) return 'image/png'
+  if (lower.endsWith('.jpg') || lower.endsWith('.jpeg')) return 'image/jpeg'
+  if (lower.endsWith('.gif')) return 'image/gif'
+  if (lower.endsWith('.svg')) return 'image/svg+xml'
+  if (lower.endsWith('.mp3')) return 'audio/mpeg'
+  if (lower.endsWith('.wav')) return 'audio/wav'
+  if (lower.endsWith('.ogg')) return 'audio/ogg'
+  if (lower.endsWith('.txt')) return 'text/plain'
+  if (lower.endsWith('.ini')) return 'text/plain'
+  if (lower.endsWith('.mp4')) return 'video/mp4'
+  return 'application/octet-stream'
+}

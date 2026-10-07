@@ -1,0 +1,27 @@
+# dependencies
+node_modules/
+
+# next.js
+.next/
+out/
+build/
+next-env.d.ts
+
+# production archive cache (1.08 GB, downloaded at runtime)
+.revcdos-cache/
+
+# database
+db/*.db
+db/*.db-journal
+
+# env
+.env
+.env.*
+!.env.example
+
+# misc
+.DS_Store
+*.pem
+*.log
+*.tsbuildinfo
+.vercel
