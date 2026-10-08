@@ -1,0 +1,24 @@
+[Unit]
+Description=web-vicecity archive relay (partitioned range server)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 按实际路径修改：
+WorkingDirectory=/opt/web-vicecity
+ExecStart=/usr/bin/node server.js
+Restart=always
+RestartSec=5
+# 资源保护：磁盘写入主要是 361 MB 播种
+MemoryMax=512M
+# 可选配置（取消注释并按需修改）：
+# Environment=PORT=8787
+# Environment=RELAY_TOKEN=change-me
+# Environment=DATA_DIR=/var/lib/web-vicecity-relay
+# EnvironmentFile=/opt/web-vicecity/.env
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
