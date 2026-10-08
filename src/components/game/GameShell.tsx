@@ -52,6 +52,13 @@ export default function GameShell() {
         .catch((err) => console.warn('[sw] registration failed:', err))
     }
 
+    // Kick off the server-side warm-up of the two engine files right away:
+    // in remote mode the server pulls the ~61 MB data package from upstream
+    // in the background, so by the time the player clicks "play" the chunked
+    // download runs at full speed (progress is visible via the loading
+    // overlay). Idempotent and cheap when already warm.
+    fetch('/api/archive/warm', { method: 'POST' }).catch(() => {})
+
     // Initial touch-state machine attributes (the engine mutates these later).
     const stateDefaults: Record<string, string> = {
       'data-is-touch': '0',
@@ -228,7 +235,7 @@ export default function GameShell() {
               commercial release and is not affiliated with Rockstar Games.
             </span>
             (
-            <a href="https://github.com/SugaryHull/re3/tree/miami" target="_blank" rel="noreferrer">
+            <a href="https://github.com/43aquarius/web-vicecity" target="_blank" rel="noreferrer">
               github
             </a>
             )
@@ -269,8 +276,8 @@ export default function GameShell() {
           <div>
             <span>
               Repo:{' '}
-              <a href="https://github.com/Lolendor/reVCDOS" target="_blank" rel="noreferrer">
-                GitHub (Lolendor/reVCDOS)
+              <a href="https://github.com/43aquarius/web-vicecity" target="_blank" rel="noreferrer">
+                GitHub (43aquarius/web-vicecity)
               </a>
             </span>
           </div>

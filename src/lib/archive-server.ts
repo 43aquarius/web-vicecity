@@ -7,11 +7,11 @@
  * /vcsky and /vcbr route handlers.
  */
 
-import { createWriteStream, statSync, mkdirSync } from 'node:fs'
+import { createWriteStream, statSync, mkdirSync, readFileSync } from 'node:fs'
 import { mkdir, readFile } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { PackedArchive, type ArchiveStats } from './packed-archive'
-import { RemoteArchive } from './remote-archive'
+import { RemoteArchive, parseRelaySources, type RelaySourceConfig } from './remote-archive'
 
 /**
  * Common serving surface for local (PackedArchive) and remote (RemoteArchive)
@@ -27,6 +27,51 @@ export interface ArchiveSource {
 
 export const ARCHIVE_URL =
   process.env.REVCDOS_ARCHIVE_URL ?? 'https://folder.morgen.qzz.io/revcdos.bin'
+
+/**
+ * Relay config resolution: env var first, then a deployable JSON file.
+ *
+ * The JSON fallback exists for published containers where custom env vars
+ * cannot be set: edit public/relay.config.json (it ships with the standalone
+ * build) and redeploy. The file uses the exact same string format as the
+ * REVCDOS_RELAYS environment variable, so instructions stay consistent:
+ *
+ *   { "REVCDOS_RELAYS": "a=https://relay-a.example.com/revcdos.bin:0-361454906,b=…" }
+ */
+function resolveRelayConfig(): string | undefined {
+  if (process.env.REVCDOS_RELAYS !== undefined) return process.env.REVCDOS_RELAYS
+  const candidates = [
+    '/home/z/my-project/public/relay.config.json',
+    `${process.cwd()}/public/relay.config.json`,
+    `${process.cwd()}/relay.config.json`,
+  ]
+  for (const candidate of candidates) {
+    try {
+      const raw = JSON.parse(readFileSync(candidate, 'utf-8')) as Record<string, unknown>
+      const val = raw['REVCDOS_RELAYS']
+      if (typeof val === 'string' && val.trim()) {
+        console.log(`[archive] relay config loaded from ${candidate}`)
+        return val
+      }
+    } catch {
+      /* not present / not JSON — try the next candidate */
+    }
+  }
+  return undefined
+}
+
+/**
+ * Partitioned archive relays (aux servers) configured via REVCDOS_RELAYS —
+ * see parseRelaySources() for the format. Parsed once at module level so the
+ * /api/archive/sources route can expose the routing map to the Service
+ * Worker no matter which serving mode the archive itself runs in.
+ */
+const RELAY_SOURCES = parseRelaySources(resolveRelayConfig())
+
+/** Relay partition map for clients (copy of the parsed env config). */
+export function getRelaySources(): RelaySourceConfig[] {
+  return RELAY_SOURCES.map((r) => ({ ...r }))
+}
 
 /**
  * Resolve the local archive path with fallbacks so the server also boots in
@@ -86,6 +131,16 @@ async function indexSize(indexPath: string): Promise<number> {
 
 export type ArchiveState = 'idle' | 'downloading' | 'indexing' | 'ready' | 'error'
 
+export type WarmPhase = 'idle' | 'pending' | 'downloading' | 'decompressing' | 'done' | 'error'
+
+export interface WarmEntry {
+  phase: WarmPhase
+  /** Received raw (compressed) bytes — meaningful while phase='downloading'. */
+  received: number
+  total: number
+  error?: string
+}
+
 export interface ArchiveStatus {
   state: ArchiveState
   /** 'local' = read off the local archive file; 'remote' = ranged reads from upstream. */
@@ -96,6 +151,10 @@ export interface ArchiveStatus {
   files: number
   folders: number
   error?: string
+  /** Server-side warm-up of the two engine files (remote mode). */
+  warm?: { data: WarmEntry; wasm: WarmEntry }
+  /** Partitioned relays configured via REVCDOS_RELAYS (aux servers). */
+  relays?: Array<{ id: string; url: string; start: number; end: number }>
 }
 
 const status: ArchiveStatus = {
@@ -116,22 +175,67 @@ const status: ArchiveStatus = {
  * created by the OLD module (whose class shape may lack new methods). Bump
  * this constant whenever PackedArchive's public API changes.
  */
-const ARCHIVE_INSTANCE_VERSION = 3
+const ARCHIVE_INSTANCE_VERSION = 4
 
 interface ArchiveGlobal {
   archive?: ArchiveSource | null
   initPromise?: Promise<ArchiveSource> | null
   status?: ArchiveStatus
   version?: number
+  warm?: Map<string, WarmEntry>
+  warmStarted?: boolean
 }
 const g = globalThis as typeof globalThis & { __revcdosArchive?: ArchiveGlobal }
 if (!g.__revcdosArchive) {
-  g.__revcdosArchive = { archive: null, initPromise: null, status, version: ARCHIVE_INSTANCE_VERSION }
+  g.__revcdosArchive = {
+    archive: null,
+    initPromise: null,
+    status,
+    version: ARCHIVE_INSTANCE_VERSION,
+    warm: new Map(),
+    warmStarted: false,
+  }
+}
+
+/** The two engine files the launcher downloads in ranged chunks. */
+const WARM_DATA_PATH = 'vcbr/vc-sky-en-v6.data.br'
+const WARM_WASM_PATH = 'vcbr/vc-sky-en-v6.wasm.br'
+
+function warmEntry(path: string): WarmEntry {
+  const store = g.__revcdosArchive!
+  if (!store.warm) store.warm = new Map()
+  let e = store.warm.get(path)
+  if (!e) {
+    e = { phase: 'idle', received: 0, total: 0 }
+    store.warm.set(path, e)
+  }
+  return e
+}
+
+function touchWarmPhase(path: string, phase: WarmPhase): void {
+  const e = g.__revcdosArchive?.warm?.get(path)
+  if (e && e.phase !== 'done' && e.phase !== 'error') e.phase = phase
+}
+
+function snapshotWarm(): { data: WarmEntry; wasm: WarmEntry } | undefined {
+  const store = g.__revcdosArchive
+  if (!store?.warm) return undefined
+  return {
+    data: { ...store.warm.get(WARM_DATA_PATH) ?? { phase: 'idle', received: 0, total: 0 } },
+    wasm: { ...store.warm.get(WARM_WASM_PATH) ?? { phase: 'idle', received: 0, total: 0 } },
+  }
 }
 
 export function getArchiveStatus(): ArchiveStatus {
-  const s = g.__revcdosArchive?.status ?? status
-  return { ...s }
+  const s = g.__revcdosArchive?.status
+  if (s) {
+    const out: ArchiveStatus = { ...s, warm: snapshotWarm() }
+    if (RELAY_SOURCES.length > 0) {
+      out.relays = RELAY_SOURCES.map((r) => ({ id: r.id, url: r.url, start: r.start, end: r.end }))
+    }
+    return out
+  }
+  return status
 }
 
 function setStatus(patch: Partial<ArchiveStatus>): void {
@@ -171,9 +275,52 @@ export function getArchive(): Promise<ArchiveSource> {
 
 /** Fire-and-forget preparation (used by instrumentation + landing page). */
 export function prepareArchive(): void {
-  getArchive().catch((err) => {
-    console.error('[archive] preparation failed:', err)
-  })
+  getArchive()
+    .then(() => warmArchive())
+    .catch((err) => {
+      console.error('[archive] preparation failed:', err)
+    })
+}
+
+/**
+ * Warm up the two engine files (data + wasm) in the background so the first
+ * player click does not pay the upstream fetch latency. Idempotent: the
+ * materialisation cache + inflight dedup make repeated calls free. Safe in
+ * both local (disk read, fast) and remote (upstream ranged read) modes.
+ */
+export function warmArchive(): void {
+  const store = g.__revcdosArchive!
+  getArchive()
+    .then((arc) => {
+      for (const path of [WARM_DATA_PATH, WARM_WASM_PATH]) {
+        const w = warmEntry(path)
+        if (
+          w.phase === 'done' ||
+          w.phase === 'error' ||
+          w.phase === 'downloading' ||
+          w.phase === 'decompressing' ||
+          w.phase === 'pending'
+        ) {
+          continue
+        }
+        w.phase = 'pending'
+        w.received = 0
+        w.total = 0
+        w.error = undefined
+        getMaterialized(arc, path)
+          .then(() => {
+            w.phase = 'done'
+          })
+          .catch((err: unknown) => {
+            w.phase = 'error'
+            w.error = err instanceof Error ? err.message : String(err)
+            console.error(`[archive] warm-up failed for ${path}:`, w.error)
+          })
+      }
+    })
+    .catch((err) => {
+      console.error('[archive] warm-up could not start:', err)
+    })
 }
 
 async function fileSize(path: string): Promise<number> {
@@ -277,7 +424,19 @@ async function init(): Promise<ArchiveSource> {
     )
   }
   s.state = 'indexing'
-  const arc = new RemoteArchive(indexPath, ARCHIVE_URL)
+  const arc = new RemoteArchive(
+    indexPath,
+    ARCHIVE_URL,
+    (path, received, total) => {
+      const w = g.__revcdosArchive?.warm?.get(path)
+      if (w && w.phase !== 'done' && w.phase !== 'error') {
+        w.phase = 'downloading'
+        w.received = received
+        w.total = total
+      }
+    },
+    RELAY_SOURCES,
+  )
   await arc.init()
   return finishReady(arc, 'remote', s)
 }
@@ -383,7 +542,7 @@ async function pipeTo(
  * ~135 MB decompressed and the wasm ~8 MB, so both fit comfortably while the
  * total stays bounded regardless of request patterns.
  */
-const MAX_MATERIALIZED_BYTES = 320 * 1024 * 1024
+const MAX_MATERIALIZED_BYTES = 192 * 1024 * 1024
 
 interface MaterializedGlobal {
   lru: Map<string, Uint8Array>
@@ -428,11 +587,18 @@ async function materialize(
   const reader = stream.getReader()
   const chunks: Uint8Array[] = []
   let total = 0
+  let warmTouched = false
   for (;;) {
     const { done, value } = await reader.read()
     if (done) break
     chunks.push(value)
     total += value.length
+    if (!warmTouched) {
+      warmTouched = true
+      // Raw bytes are in (raw fetch resolves before decompression starts for
+      // the remote backend) — the decompression pass is running now.
+      touchWarmPhase(entryPath, 'decompressing')
+    }
   }
   const out = new Uint8Array(total)
   let pos = 0

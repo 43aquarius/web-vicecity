@@ -2,19 +2,23 @@
  * reVCDOS archive Service Worker — browser-direct asset serving.
  *
  * Intercepts /vcsky/* and /vcbr/* requests and serves them WITHOUT the
- * server: the flat index (public/game/revcdos-index.json) maps every path
- * to its byte range inside the 1.08 GB packed archive; the matching bytes
- * are fetched with HTTP Range requests directly from a static mirror
+ * main server: the flat index (public/game/revcdos-index.json) maps every
+ * path to its byte range inside the 1.08 GB packed archive; the matching
+ * bytes are fetched with HTTP Range requests DIRECTLY from the user's
+ * partitioned relay servers (see the repo's relay-a/relay-b branches —
+ * CORS-open range servers), or from the static GitHub mirror
  * (raw.githubusercontent.com serves cross-origin ranges), then decompressed
  * with the vendored WASM brotli decoder and cached in the browser.
  *
- * Fallback chain (never breaks the game):
+ * Source chain (never breaks the game):
  *   1. browser caches (this SW's asset cache + the launcher's own cache)
- *   2. mirror ranged reads + WASM brotli decompress
- *   3. same-origin server proxy (fetch(request) passthrough — the server
- *      has its own remote/local archive modes)
- * After 3 consecutive mirror failures the SW bypasses the mirror for the
- * rest of this worker lifetime.
+ *   2. partitioned relays (/api/archive/sources routing map) — user's aux
+ *      servers, disk-cached partitions, CORS open
+ *   3. GitHub raw mirror ranged reads + WASM brotli decompress
+ *   4. same-origin server proxy (fetch(request) passthrough — the server has
+ *      its own relay-routing / remote / local archive modes)
+ * Relays and the mirror each have their own circuit breaker (3 consecutive
+ * failures → 2 min cool-down) so a dead source never stalls requests.
  */
 
 importScripts('/game/brotli-dec.js')
@@ -27,7 +31,7 @@ const ASSET_CACHE = 'revcdos-assets-v1'
 //      after parts are (re)pushed).
 //   2. <commit-sha>/... - immutable path, immune to branch propagation.
 // Parts are plain byte slices of revcdos.bin (see scripts/push-archive-parts.sh).
-const MIRROR_REPO = '43aquaris/web-vicecity'
+const MIRROR_REPO = '43aquarius/web-vicecity'
 const MIRROR_BRANCH = 'archive-data'
 const MIRROR_SHA = '6e81c6b1ef5d553aa4da54c43ac6970f75697d79'
 const MIRROR_BASES = [
@@ -36,22 +40,173 @@ const MIRROR_BASES = [
 ]
 const MIRROR_PART_FILE = 'revcdos.bin.part'
 const PART_SIZE = 96_000_000 // bytes — MUST match scripts/split-and-push-archive.sh (split -b 96MB, SI units)
-const MIRROR_TIMEOUT_MS = 25_000
+const MIRROR_TIMEOUT_MS = 15_000
 const MIRROR_FAILURE_LIMIT = 3
 const MIRROR_BUST_RETRIES = 3
 // After this many consecutive failures the mirror is bypassed for a cool-down
 // window (CDN negative-cache propagation, transient 404/5xx), then retried.
 const MIRROR_COOLDOWN_MS = 120_000
+// A mirror reachability probe gate: the raw.githubusercontent.com host is
+// unreachable from some networks (e.g. mainland China). Probing it ONCE per
+// worker lifetime (a 16-byte ranged read, 8 s timeout) avoids stalling every
+// archive request behind per-part mirror timeouts on such networks.
+const MIRROR_PROBE_TIMEOUT_MS = 8_000
+// Network-level probe failure (timeout / DNS / refused): mirror is presumed
+// blocked and is skipped for a long cool-down (persisted via the Cache API so
+// later SW lifetimes remember). A plain 404/5xx answer means "reachable but
+// wrong" and only gets the short cool-down.
+const MIRROR_BLOCKED_MS = 2 * 60 * 60 * 1000
+const SW_STATE_CACHE = 'revcdos-sw-state'
+const SW_STATE_KEY = 'mirror-blocked-until'
 
 let indexPromise = null
 let brotliReady = null
 let mirrorFailures = 0
 let mirrorCooldownUntil = 0
+// 'pending' → probe in flight (requests bypass the mirror meanwhile);
+// 'ok' → mirror usable; 'blocked' → probe failed on the network level.
+let mirrorProbeState = 'pending'
 // Cache-bust token for mirror URLs. Assigned randomly on first use and
 // remembered once it works — the CDN caches per exact URL, so a stable
 // working token hits a warm positive cache while a fresh random one escapes
 // stale per-URL negative caches (right after parts are (re)pushed).
 let mirrorBust = ''
+
+// ---------- partitioned relays (user's aux servers) ----------
+// The relay routing map comes from /api/archive/sources (same-origin) —
+// [{id, url, start, end}] with GLOBAL archive byte partitions. Relay URLs
+// are FULL archive URLs (may carry ?token=…) and serve standard 206 ranges
+// with CORS open, so the browser fetches the player's own servers directly.
+const RELAY_SOURCES_URL = '/api/archive/sources'
+const RELAY_TIMEOUT_MS = 15_000
+const RELAY_RETRIES = 2
+const RELAY_FAILURE_LIMIT = 3
+const RELAY_COOLDOWN_MS = 120_000
+
+let relayList = [] // [{id, url, start, end}]
+let relaySourcesPromise = null
+let relayFailures = 0
+let relayCooldownUntil = 0
+// Set by the range fetchers ('relay' | 'mirror') for observability headers.
+let lastRangeSource = 'mirror'
+
+function ensureRelaySources() {
+  if (!relaySourcesPromise) {
+    relaySourcesPromise = fetch(RELAY_SOURCES_URL, { cache: 'no-store' })
+      .then((r) => {
+        if (!r.ok) throw new Error(`sources HTTP ${r.status}`)
+        return r.json()
+      })
+      .then((cfg) => {
+        const list = Array.isArray(cfg && cfg.relays) ? cfg.relays : []
+        const clean = list.filter(
+          (r) => r && typeof r.url === 'string' && Number.isFinite(r.start) && Number.isFinite(r.end) && r.end > r.start,
+        )
+        relayList = clean
+        if (clean.length > 0) {
+          console.warn('[sw] relay routing map loaded:', clean.map((r) => `${r.id}=[${r.start}, ${r.end})`).join(' '))
+        }
+      })
+      .catch((e) => {
+        // Sources endpoint unreachable — no relays; mirror + server remain.
+        console.warn('[sw] relay sources unavailable:', e && e.message)
+        relayList = []
+      })
+  }
+  return relaySourcesPromise
+}
+
+function relayCircuitOk() {
+  return relayList.length > 0 && relayCooldownUntil < Date.now()
+}
+
+function noteRelayFailure() {
+  relayFailures++
+  if (relayFailures >= RELAY_FAILURE_LIMIT) {
+    relayCooldownUntil = Date.now() + RELAY_COOLDOWN_MS
+    relayFailures = 0
+    console.warn('[sw] relays failing — bypassing for ' + RELAY_COOLDOWN_MS / 1000 + 's (mirror/server take over)')
+  }
+}
+
+/**
+ * Whether the relays FULLY cover [offset, offset+length). Partial coverage
+ * falls through to the mirror (config gaps are a setup mistake, the mirror
+ * or server still serve everything).
+ */
+function relaysCover(offset, length) {
+  if (!relayCircuitOk()) return false
+  let pos = offset
+  const end = offset + length
+  for (const r of [...relayList].sort((a, b) => a.start - b.start)) {
+    if (r.end <= pos) continue
+    if (r.start > pos) return false // gap
+    pos = Math.min(end, r.end)
+    if (pos >= end) return true
+  }
+  return pos >= end
+}
+
+/**
+ * Fetch [offset, offset+length) from the partitioned relays: split per owner,
+ * fetch segments in parallel, verify each 206 + length, concatenate.
+ * Throws on any failure (caller falls back to the mirror).
+ */
+async function fetchRelayRange(offset, length) {
+  const segments = []
+  let pos = offset
+  const end = offset + length
+  for (const r of [...relayList].sort((a, b) => a.start - b.start)) {
+    if (r.end <= pos || r.start >= end) continue
+    const segStart = Math.max(pos, r.start)
+    const segEnd = Math.min(r.end, end)
+    if (segStart > pos) throw new Error('relay gap at ' + pos)
+    segments.push({ relay: r, start: segStart, length: segEnd - segStart })
+    pos = segEnd
+  }
+  if (pos < end) throw new Error('relays do not cover tail at ' + pos)
+
+  const fetched = await Promise.all(
+    segments.map(async (seg) => {
+      let lastErr = null
+      for (let attempt = 1; attempt <= RELAY_RETRIES; attempt++) {
+        try {
+          const res = await fetch(seg.relay.url, {
+            headers: { Range: `bytes=${seg.start}-${seg.start + seg.length - 1}` },
+            cache: 'no-store',
+            signal: AbortSignal.timeout(
+              Math.max(RELAY_TIMEOUT_MS, Math.min(600_000, 10_000 + seg.length * 20)),
+            ),
+          })
+          if (res.status !== 206) {
+            await res.arrayBuffer().catch(() => {})
+            throw new Error(`relay ${seg.relay.id} HTTP ${res.status}`)
+          }
+          const b = new Uint8Array(await res.arrayBuffer())
+          if (b.length !== seg.length) {
+            throw new Error(`relay ${seg.relay.id} short read ${b.length}/${seg.length}`)
+          }
+          return b
+        } catch (err) {
+          lastErr = err
+          console.warn('[sw] relay ' + seg.relay.id + ' attempt ' + attempt + '/' + RELAY_RETRIES + ' failed:', err && err.message)
+        }
+      }
+      throw lastErr || new Error('relay segment failed')
+    }),
+  )
+
+  relayFailures = 0 // success resets the circuit
+  lastRangeSource = 'relay'
+  if (fetched.length === 1) return fetched[0]
+  const out = new Uint8Array(length)
+  let o = 0
+  for (const p of fetched) {
+    out.set(p, o)
+    o += p.length
+  }
+  return out
+}
 
 // ---------- lazily loaded helpers ----------
 
@@ -85,6 +240,87 @@ function getBrotli() {
       })
   }
   return brotliReady
+}
+
+// ---------- mirror reachability ----------
+
+/** Remember "mirror blocked until T" across SW restarts (Cache API). */
+async function persistBlockedUntil(ts) {
+  try {
+    const cache = await caches.open(SW_STATE_CACHE)
+    await cache.put(SW_STATE_KEY, new Response(String(ts)))
+  } catch (e) { /* best effort */ }
+}
+
+async function readPersistedBlockedUntil() {
+  try {
+    const cache = await caches.open(SW_STATE_CACHE)
+    const res = await cache.match(SW_STATE_KEY)
+    if (!res) return 0
+    return Number(await res.text()) || 0
+  } catch (e) {
+    return 0
+  }
+}
+
+async function clearPersistedBlocked() {
+  try {
+    const cache = await caches.open(SW_STATE_CACHE)
+    await cache.delete(SW_STATE_KEY)
+  } catch (e) { /* best effort */ }
+}
+
+/**
+ * One-shot 16-byte ranged read against the mirror. Sets mirrorProbeState:
+ *   'ok'      — reachable, ranged reads work → mirror may serve requests
+ *   'blocked' — network-level failure (timeout / DNS / refused) → long skip
+ * A 404/5xx response means the host IS reachable (only the path is wrong) →
+ * short cool-down, ordinary fallback continues.
+ */
+function probeMirror() {
+  const url =
+    MIRROR_BASES[0] + MIRROR_PART_FILE + '00' + '?rb=' + Date.now().toString(36)
+  return fetch(url, {
+    headers: { Range: 'bytes=0-15' },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(MIRROR_PROBE_TIMEOUT_MS),
+  })
+    .then(async (res) => {
+      await res.arrayBuffer().catch(() => {})
+      if (res.status === 206 || res.status === 200) {
+        mirrorProbeState = 'ok'
+        return
+      }
+      // Reachable but wrong content — short cool-down only.
+      mirrorProbeState = 'ok'
+      mirrorCooldownUntil = Math.max(mirrorCooldownUntil, Date.now() + 10 * 60_000)
+      console.warn('[sw] mirror probe returned HTTP', res.status, '— 10 min cool-down')
+    })
+    .catch(() => {
+      mirrorProbeState = 'blocked'
+      mirrorCooldownUntil = Date.now() + MIRROR_BLOCKED_MS
+      persistBlockedUntil(mirrorCooldownUntil)
+      console.warn('[sw] mirror unreachable — serving via server proxy for 2 h')
+    })
+}
+
+/**
+ * Whether a request may try the mirror at all: probe must have settled 'ok',
+ * persisted/soft cool-downs must have expired.
+ */
+function mirrorAllowed() {
+  if (mirrorCooldownUntil > Date.now()) return false
+  if (mirrorProbeState === 'pending') return false // never stall on the probe
+  return mirrorProbeState === 'ok'
+}
+
+async function mirrorSucceeded() {
+  // A successful mirror read clears any blocked state (e.g. the user's
+  // network changed) so subsequent sessions use it again.
+  if (mirrorCooldownUntil > 0) {
+    mirrorCooldownUntil = 0
+    await clearPersistedBlocked()
+  }
 }
 
 // ---------- mirror ranged reads ----------
@@ -132,6 +368,7 @@ async function fetchMirrorRange(offset, length) {
         }
         buf = b
         mirrorBust = bust
+        mirrorSucceeded()
         break outer
       } catch (err) {
         lastErr = err
@@ -156,11 +393,24 @@ async function entryFor(path) {
   return idx.map.get(path) || null
 }
 
-/** Fetch the stored brotli bytes from the mirror and decompress them. */
+/** Fetch the stored brotli bytes — relays first, then the mirror. */
 async function loadDecompressed(path) {
   const entry = await entryFor(path)
   if (!entry) return null
-  const br = await fetchMirrorRange(entry[0], entry[1])
+  let br = null
+  await ensureRelaySources()
+  if (relaysCover(entry[0], entry[1])) {
+    try {
+      br = await fetchRelayRange(entry[0], entry[1])
+    } catch (err) {
+      noteRelayFailure()
+      console.warn('[sw] relay fetch failed, falling back to mirror:', err && err.message)
+    }
+  }
+  if (!br) {
+    br = await fetchMirrorRange(entry[0], entry[1])
+    lastRangeSource = 'mirror'
+  }
   const brotli = await getBrotli()
   return brotli.decompress(br)
 }
@@ -233,7 +483,7 @@ async function serveWhole(cacheKey, entryPath) {
     'Content-Type': mediaType(entryPath),
     'Content-Length': String(data.length),
     'Cache-Control': 'public, max-age=86400',
-    'X-ReVCDOS-Source': 'sw-mirror',
+    'X-ReVCDOS-Source': 'sw-' + lastRangeSource,
   })
   const res = new Response(data, { status: 200, headers })
   cache.put(cacheKey, res.clone()).catch(() => {})
@@ -272,7 +522,7 @@ async function serveRanged(request, cacheKey, entryPath) {
     'Content-Range': `bytes ${start}-${end}/${total}`,
     'Content-Length': String(end - start + 1),
     'Cache-Control': 'no-store',
-    'X-ReVCDOS-Source': 'sw-mirror',
+    'X-ReVCDOS-Source': 'sw-' + lastRangeSource,
   })
   if (request.method === 'HEAD') return new Response(null, { status: 206, headers })
   return new Response(data.subarray(start, end + 1), { status: 206, headers })
@@ -300,7 +550,15 @@ async function handleArchive(request) {
   }
 
   try {
-    if (Date.now() < mirrorCooldownUntil) throw new Error('mirror circuit open')
+    // Relays (if configured) are tried inside serveRanged/serveWhole via
+    // loadDecompressed; the mirror path needs its probe gate. When neither
+    // direct source is currently usable, throw to hit the server fallback.
+    await ensureRelaySources()
+    const relayPossible = relayCircuitOk()
+    const mirrorPossible = mirrorAllowed()
+    if (!relayPossible && !mirrorPossible) {
+      throw new Error(mirrorProbeState === 'blocked' ? 'mirror blocked, no relays' : 'no direct source available')
+    }
     const res = request.headers.get('range')
       ? await serveRanged(request, cacheKey, entryPath)
       : await serveWhole(cacheKey, entryPath)
@@ -308,7 +566,7 @@ async function handleArchive(request) {
     return res
   } catch (err) {
     mirrorFailures++
-    if (mirrorFailures >= MIRROR_FAILURE_LIMIT) {
+    if (mirrorProbeState === 'ok' && mirrorFailures >= MIRROR_FAILURE_LIMIT) {
       mirrorCooldownUntil = Date.now() + MIRROR_COOLDOWN_MS
       mirrorFailures = 0
     }
@@ -333,6 +591,13 @@ async function handleArchive(request) {
 self.addEventListener('fetch', (event) => {
   const request = event.request
   if (request.method !== 'GET' && request.method !== 'HEAD') return
+  let url
+  try {
+    url = new URL(request.url)
+  } catch (e) {
+    return
+  }
+  if (url.origin !== self.location.origin) return
   if (!url.pathname.startsWith('/vcsky/') && !url.pathname.startsWith('/vcbr/')) return
   event.respondWith(handleArchive(request))
 })
@@ -351,7 +616,19 @@ self.addEventListener('activate', (event) => {
       await self.clients.claim()
       // Drop caches from older SW generations if the version constant changed.
       const keys = await caches.keys()
-      await Promise.all(keys.filter((k) => k !== ASSET_CACHE && k !== location.hostname).map((k) => caches.delete(k)))
+      await Promise.all(keys.filter((k) => k !== ASSET_CACHE && k !== location.hostname && k !== SW_STATE_CACHE).map((k) => caches.delete(k)))
+      // Load the relay routing map (non-blocking failures → no relays).
+      ensureRelaySources().catch(() => {})
+      // Restore any persisted "mirror blocked" verdict, then (re)probe the
+      // mirror reachability in the background — requests never wait on it.
+      const blockedUntil = await readPersistedBlockedUntil()
+      if (blockedUntil > Date.now()) {
+        mirrorCooldownUntil = blockedUntil
+        mirrorProbeState = 'blocked'
+        console.warn('[sw] mirror still in persisted cool-down until', new Date(blockedUntil).toISOString())
+      } else {
+        probeMirror()
+      }
     })(),
   )
 })

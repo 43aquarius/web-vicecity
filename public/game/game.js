@@ -53,6 +53,24 @@ const translations = {
         decompressing: "Decompressing...",
         downloadFailed: "Download failed. Please check your connection and reload the page to retry.",
         serverPreparing: "Server is preparing game assets (%1%), first launch can take a few minutes...",
+        loadTitle: "ENTERING VICE CITY",
+        loadWarmTitle: "Server is preparing the game data",
+        loadWarmHint: "The first launch after a deploy pulls ~61 MB from the origin — usually 1–2 minutes.",
+        loadDecompress: "Decompressing...",
+        loadConnect: "Connecting to server...",
+        loadConnectSlow: "The server is warming up for first use; this can take a while...",
+        loadDownloadTitle: "Downloading game data",
+        loadDownloadHint: "First load is ~135 MB. It is cached in your browser, so the next launch is instant.",
+        loadWasmTitle: "Downloading engine core",
+        loadEngineTitle: "Starting the engine",
+        loadEngineHint: "The first start compiles the engine — this may take up to a minute.",
+        loadEngineSlow: "The engine is taking longer than usual. If nothing happens for a while, reload the page to retry.",
+        loadErrorTitle: "Load failed",
+        loadRetry: "Retry",
+        loadRetryChunk: "Network hiccup, retrying (attempt %1%)...",
+        loadStall: "Slow network — still working, don't close the page...",
+        loadSpeed: "MB/s",
+        loadETA: "%1% left",
         enterKey: "enter your key",
         clickToContinue: "Click to continue...",
         enterJsDosKey: "Enter js-dos key (5 len)",
@@ -84,6 +102,24 @@ const translations = {
         decompressing: "Распаковка...",
         downloadFailed: "Ошибка загрузки. Проверьте соединение и обновите страницу.",
         serverPreparing: "Сервер готовит игровые ресурсы (%1%), первый запуск может занять несколько минут...",
+        loadTitle: "ЗАГРУЗКА VICE CITY",
+        loadWarmTitle: "Сервер готовит игровые данные",
+        loadWarmHint: "Первый запуск после деплоя загружает ~61 МБ с исходного сервера — обычно 1–2 минуты.",
+        loadDecompress: "Распаковка...",
+        loadConnect: "Подключение к серверу...",
+        loadConnectSlow: "Сервер прогревается после первого запуска, это может занять время...",
+        loadDownloadTitle: "Загрузка игровых данных",
+        loadDownloadHint: "Первая загрузка ~135 МБ. Данные кешируются в браузере — следующий запуск мгновенный.",
+        loadWasmTitle: "Загрузка ядра движка",
+        loadEngineTitle: "Запуск движка",
+        loadEngineHint: "Первый запуск компилирует движок — это может занять до минуты.",
+        loadEngineSlow: "Запуск занимает больше обычного. Если ничего не происходит, обновите страницу.",
+        loadErrorTitle: "Ошибка загрузки",
+        loadRetry: "Повторить",
+        loadRetryChunk: "Сетевой сбой, повторная попытка (%1%)...",
+        loadStall: "Медленная сеть — загрузка продолжается, не закрывайте страницу...",
+        loadSpeed: "МБ/с",
+        loadETA: "осталось %1%",
         enterKey: "введите ваш ключ",
         clickToContinue: "Нажмите для продолжения...",
         enterJsDosKey: "Введите ключ js-dos (5 букв)",
@@ -124,6 +160,24 @@ const translations = {
         decompressing: "解压中...",
         downloadFailed: "下载失败，请检查网络后刷新页面重试。",
         serverPreparing: "服务器正在准备游戏资源（%1%），首次启动可能需要几分钟，请稍候…",
+        loadTitle: "正在进入罪恶都市",
+        loadWarmTitle: "服务器正在准备游戏数据",
+        loadWarmHint: "部署后首次运行需从源站拉取约 61 MB，通常需要 1～2 分钟。",
+        loadDecompress: "正在解压...",
+        loadConnect: "正在连接服务器...",
+        loadConnectSlow: "服务器首次预热中，可能需要一些时间...",
+        loadDownloadTitle: "正在下载游戏数据",
+        loadDownloadHint: "首次加载约 135 MB，完成后会缓存在本浏览器，下次秒进。",
+        loadWasmTitle: "正在下载引擎核心",
+        loadEngineTitle: "正在启动游戏引擎",
+        loadEngineHint: "首次启动需要编译引擎，可能需要一分钟左右。",
+        loadEngineSlow: "启动耗时比预期久；若长时间无响应，可刷新页面重试。",
+        loadErrorTitle: "加载失败",
+        loadRetry: "重试",
+        loadRetryChunk: "网络波动，重试中（第 %1% 次）...",
+        loadStall: "网络较慢，仍在努力下载，请不要关闭页面...",
+        loadSpeed: "MB/s",
+        loadETA: "剩余约 %1%",
         enterKey: "输入你的密钥",
         clickToContinue: "点击继续...",
         enterJsDosKey: "输入 js-dos 密钥（5 位）",
@@ -248,9 +302,10 @@ function timeoutSignal(ms) {
     return undefined;
 }
 
-async function fetchWithRetry(url, headers, retries, timeoutMs, label) {
+async function fetchWithRetry(url, headers, retries, timeoutMs, label, onRetry) {
     let lastErr;
     for (let attempt = 1; attempt <= retries; attempt++) {
+        if (attempt > 1 && onRetry) onRetry(attempt);
         try {
             const signal = timeoutSignal(timeoutMs);
             // cache: 'no-store' bypasses the HTTP disk cache — a previously
@@ -280,10 +335,17 @@ async function brotliDecompress(bytes) {
 }
 
 // Probe the total size of the file via a 1-byte Range request. Returns 0
-// when Range is not honoured (caller falls back).
+// when Range is not honoured (caller falls back). The probe can legitimately
+// block for a long time on a cold server (the first ranged request triggers
+// the server-side materialisation of a ~61 MB file), hence the generous
+// attempt budget.
 async function probeStoredSize(url) {
     try {
-        const res = await fetchWithRetry(url, { Range: 'bytes=0-0' }, 3, 20000, 'probe');
+        const res = await fetchWithRetry(url, { Range: 'bytes=0-0' }, 5, 30000, 'probe', (attempt) => {
+            LoadingUI.phase('connect');
+            LoadingUI.hint(t('loadConnectSlow'));
+            LoadingUI.retrying(attempt);
+        });
         if (res.status === 206) {
             const cr = res.headers.get('content-range') || '';
             const total = Number(cr.split('/')[1]);
@@ -299,7 +361,7 @@ async function probeStoredSize(url) {
 // Download the file content in ranged chunks and assemble it. Returns the
 // assembled Uint8Array, or null when the server/proxy does not honour Range
 // (the caller then falls back to the single-stream path).
-async function downloadChunked(url, total, onProgress) {
+async function downloadChunked(url, total, onProgress, onRetry) {
     const out = new Uint8Array(total);
     let received = 0;
     while (received < total) {
@@ -307,7 +369,7 @@ async function downloadChunked(url, total, onProgress) {
         const end = Math.min(start + DOWNLOAD_CHUNK_SIZE, total) - 1;
         let res;
         try {
-            res = await fetchWithRetry(url, { Range: `bytes=${start}-${end}` }, CHUNK_RETRIES, CHUNK_TIMEOUT_MS, `chunk ${start}-${end}`);
+            res = await fetchWithRetry(url, { Range: `bytes=${start}-${end}` }, CHUNK_RETRIES, CHUNK_TIMEOUT_MS, `chunk ${start}-${end}`, onRetry);
         } catch (err) {
             return null;
         }
@@ -331,27 +393,347 @@ async function downloadChunked(url, total, onProgress) {
 }
 
 // Original single-stream download (the response is transparently decoded by
-// the browser when served with Content-Encoding: br).
+// the browser when served with Content-Encoding: br). A stall watchdog
+// aborts the request when no bytes arrive for 60 s — previously a stalled
+// stream hung the loader forever behind a black screen.
+const STREAM_STALL_MS = 60000;
+
 async function downloadStreamed(url, onProgress) {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
-    const reader = response.body.getReader();
-    let receivedLength = 0;
-    let chunks = [];
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        receivedLength += value.length;
-        if (onProgress) onProgress(receivedLength);
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
+    let stallTimer = null;
+    const clearStall = () => {
+        if (stallTimer) { clearTimeout(stallTimer); stallTimer = null; }
+    };
+    const armStall = () => {
+        if (!controller) return;
+        clearStall();
+        stallTimer = setTimeout(() => {
+            console.warn('[download] stream stalled for 60 s — aborting to retry');
+            try { controller.abort(); } catch (e) { /* already aborted */ }
+        }, STREAM_STALL_MS);
+    };
+    armStall();
+    try {
+        const response = await fetch(url, controller ? { signal: controller.signal } : undefined);
+        if (!response.ok) throw new Error(`HTTP ${response.status} for ${url}`);
+        const reader = response.body.getReader();
+        let receivedLength = 0;
+        const chunks = [];
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            armStall();
+            chunks.push(value);
+            receivedLength += value.length;
+            if (onProgress) onProgress(receivedLength);
+        }
+        const buffer = new Uint8Array(receivedLength);
+        let position = 0;
+        for (const chunk of chunks) {
+            buffer.set(chunk, position);
+            position += chunk.length;
+        }
+        return buffer;
+    } finally {
+        clearStall();
     }
-    const buffer = new Uint8Array(receivedLength);
-    let position = 0;
-    for (const chunk of chunks) {
-        buffer.set(chunk, position);
-        position += chunk.length;
+}
+
+// ---- Full-screen loading overlay ------------------------------------------
+// The original loader is a thin status line pinned at the bottom of the intro
+// video. On a slow first load (server warm-up, 135 MB data download, wasm
+// compile) the screen just looks BLACK and players cannot tell "still
+// downloading" from "stuck". This overlay renders an unmissable neon progress
+// card covering every phase of the boot pipeline, and never hides without the
+// game being up or a clear error (with a retry button) being shown.
+const LoadingUI = (() => {
+    let root, titleEl, phaseEl, fill, statsEl, hintEl, retryBtn;
+    let visible = false;
+    let engineMode = false;
+    let samples = []; // {t, b} speed samples
+    let hideTimer = null;
+    let engineWatchdog = null;
+
+    const PHASES = {
+        warm: ['loadWarmTitle', 'loadWarmHint'],
+        connect: ['loadConnect', ''],
+        download: ['loadDownloadTitle', 'loadDownloadHint'],
+        wasm: ['loadWasmTitle', ''],
+        engine: ['loadEngineTitle', 'loadEngineHint'],
+    };
+
+    const STYLE = `
+#vc-loading { position: fixed; inset: 0; z-index: 2147483000; display: flex; align-items: center; justify-content: center;
+  background: radial-gradient(130% 100% at 50% 18%, rgba(42,23,89,.94) 0%, rgba(8,6,26,.97) 62%, rgba(3,2,12,.985) 100%);
+  opacity: 0; transition: opacity .3s ease; pointer-events: none; }
+#vc-loading.vc-on { opacity: 1; }
+#vc-loading.vc-gone { display: none; }
+#vc-loading .vc-loading-card { width: min(92vw, 480px); text-align: center; margin: 0 auto;
+  padding: clamp(22px, 5vmin, 44px) clamp(18px, 4.5vmin, 38px) clamp(22px, 5vmin, 40px);
+  border: 1px solid rgba(255,65,147,.5); border-radius: 18px; background: rgba(16,10,40,.62);
+  box-shadow: 0 0 44px rgba(255,65,147,.22), inset 0 0 70px rgba(255,65,147,.07);
+  -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
+#vc-loading .vc-loading-brand { font-size: clamp(10px, 2.4vmin, 13px); font-weight: 700; letter-spacing: .55em; text-indent: .55em;
+  color: #ff4193; text-shadow: 0 0 14px rgba(255,65,147,.65); margin-bottom: 10px; text-transform: uppercase; }
+#vc-loading .vc-loading-title { font-size: clamp(17px, 4.2vmin, 25px); font-weight: 700; color: #fff;
+  text-shadow: 0 0 20px rgba(255,255,192,.28); margin-bottom: 20px; line-height: 1.35; }
+#vc-loading.vc-err .vc-loading-title { color: #ff6b81; text-shadow: 0 0 18px rgba(255,107,129,.45); }
+#vc-loading .vc-loading-bar { position: relative; height: 15px; border-radius: 9px; overflow: hidden;
+  border: 2px solid rgba(255,255,192,.55); background: rgba(255,255,255,.08);
+  box-shadow: 0 0 16px rgba(255,255,192,.28), inset 0 0 7px rgba(0,0,0,.55); }
+#vc-loading .vc-loading-fill { height: 100%; width: 0%; border-radius: 6px; position: absolute; top: 0; left: 0;
+  background: linear-gradient(90deg, #ffffc0, #ff4193); box-shadow: 0 0 14px rgba(255,65,147,.75);
+  transition: width .25s ease, left .25s ease; }
+#vc-loading .vc-loading-fill.indet { width: 38% !important; animation: vc-indet 1.15s ease-in-out infinite; }
+@keyframes vc-indet { 0% { left: -40%; } 100% { left: 102%; } }
+#vc-loading.vc-err .vc-loading-fill { background: linear-gradient(90deg, #ff9aa8, #ff4193); width: 100% !important; animation: none; }
+#vc-loading .vc-loading-stats { margin-top: 13px; min-height: 1.4em; font-size: clamp(12px, 2.8vmin, 15px);
+  color: rgba(255,255,255,.88); font-variant-numeric: tabular-nums; line-height: 1.5; word-break: break-all; }
+#vc-loading .vc-loading-hint { margin-top: 9px; font-size: clamp(11px, 2.5vmin, 13px);
+  color: rgba(255,255,255,.55); line-height: 1.65; }
+#vc-loading .vc-loading-retry { display: none; margin: 20px auto 0; pointer-events: auto; cursor: pointer;
+  background: none; border: 2px solid #ff4193; color: #ff4193; text-transform: uppercase; font-weight: 700;
+  padding: .45em 1.6em; border-radius: .7em; font-size: clamp(14px, 3.4vmin, 17px); letter-spacing: .08em;
+  box-shadow: inset 0 0 .6em #ff4193aa, 0 0 .8em #ff4193aa; text-shadow: 0 0 6px #ff4193aa; }
+#vc-loading .vc-loading-retry:hover, #vc-loading .vc-loading-retry:focus { background: #ff4193; color: #fff; outline: none; }
+#vc-loading.vc-err .vc-loading-retry { display: inline-block; }
+@media (max-height: 420px) { #vc-loading .vc-loading-card { padding: 14px 22px; } #vc-loading .vc-loading-title { margin-bottom: 10px; } }
+`;
+
+    function ensure() {
+        if (root) return;
+        const style = document.createElement('style');
+        style.textContent = STYLE;
+        document.head.appendChild(style);
+
+        root = document.createElement('div');
+        root.id = 'vc-loading';
+        root.className = 'vc-gone';
+        root.setAttribute('role', 'status');
+        root.setAttribute('aria-live', 'polite');
+        root.innerHTML = `
+            <div class="vc-loading-card">
+                <div class="vc-loading-brand">Vice City</div>
+                <div class="vc-loading-title" id="vc-loading-phase"></div>
+                <div class="vc-loading-bar"><div class="vc-loading-fill" id="vc-loading-fill"></div></div>
+                <div class="vc-loading-stats" id="vc-loading-stats"></div>
+                <div class="vc-loading-hint" id="vc-loading-hint"></div>
+                <button class="vc-loading-retry" id="vc-loading-retry" type="button"></button>
+            </div>`;
+        document.body.appendChild(root);
+        phaseEl = root.querySelector('#vc-loading-phase');
+        fill = root.querySelector('#vc-loading-fill');
+        statsEl = root.querySelector('#vc-loading-stats');
+        hintEl = root.querySelector('#vc-loading-hint');
+        retryBtn = root.querySelector('#vc-loading-retry');
+        retryBtn.textContent = t('loadRetry');
+        retryBtn.addEventListener('click', () => {
+            // onbeforeunload (armed once the engine starts) would block the
+            // reload with a scary prompt — clear it before retrying.
+            try { window.onbeforeunload = null; } catch (e) { /* ignore */ }
+            location.reload();
+        });
     }
-    return buffer;
+
+    function show() {
+        ensure();
+        if (hideTimer) { clearTimeout(hideTimer); hideTimer = null; }
+        root.classList.remove('vc-gone');
+        requestAnimationFrame(() => root.classList.add('vc-on'));
+        visible = true;
+    }
+
+    function hide() {
+        if (!root || !visible) return;
+        visible = false;
+        engineMode = false;
+        if (engineWatchdog) { clearTimeout(engineWatchdog); engineWatchdog = null; }
+        root.classList.remove('vc-on');
+        hideTimer = setTimeout(() => { if (root) root.classList.add('vc-gone'); }, 420);
+    }
+
+    function phase(name) {
+        const keys = PHASES[name];
+        if (!keys) return;
+        if (!visible) show();
+        engineMode = name === 'engine';
+        samples = [];
+        phaseEl.textContent = t(keys[0]);
+        hintEl.textContent = keys[1] ? t(keys[1]) : '';
+        statsEl.textContent = '';
+        fill.classList.add('indet');
+        fill.style.width = '38%';
+        fill.style.left = '';
+        root.classList.remove('vc-err');
+        if (engineMode) {
+            // Long-boot hint: the engine can legitimately take ~a minute on
+            // low-end phones; if it exceeds 90 s tell the player what to do.
+            if (engineWatchdog) clearTimeout(engineWatchdog);
+            engineWatchdog = setTimeout(() => {
+                if (visible && engineMode) hintEl.textContent = t('loadEngineSlow');
+            }, 90000);
+        }
+    }
+
+    // Decimal MB (1e6) — matches the "~135 MB" hint text and is what users
+    // expect from download managers.
+    function fmtMB(b) { return (b / 1000000).toFixed(1) + ' MB'; }
+
+    function fmtDuration(sec) {
+        if (!isFinite(sec) || sec < 0) return '';
+        if (sec < 60) {
+            return Math.max(1, Math.ceil(sec)) + (currentLanguage === 'zh' ? ' 秒' : currentLanguage === 'ru' ? ' с' : 's');
+        }
+        return Math.ceil(sec / 60) + (currentLanguage === 'zh' ? ' 分钟' : currentLanguage === 'ru' ? ' мин' : ' min');
+    }
+
+    // Sliding-window speed over the last samples (EMA-free, robust to bursts).
+    function speedNow(b) {
+        const now = Date.now();
+        samples.push({ t: now, b: b });
+        while (samples.length > 12) samples.shift();
+        if (samples.length < 2) return 0;
+        const first = samples[0];
+        const dt = (now - first.t) / 1000;
+        if (dt <= 0.35) return 0;
+        return (b - first.b) / 1048576 / dt;
+    }
+
+    function progress(current, total) {
+        if (!visible) show();
+        if (typeof total === 'number' && total > 0) {
+            const pct = Math.min(100, (current / total) * 100);
+            fill.classList.remove('indet');
+            fill.style.width = pct.toFixed(1) + '%';
+            const spd = speedNow(current);
+            const parts = [fmtMB(current) + ' / ' + fmtMB(total)];
+            if (spd > 0.01) {
+                parts.push(spd.toFixed(1) + ' ' + t('loadSpeed'));
+                const eta = (total - current) / 1048576 / spd;
+                const etaText = fmtDuration(eta);
+                if (etaText) parts.push(t('loadETA').replace('%1%', etaText));
+            }
+            statsEl.textContent = parts.join('  ·  ');
+        } else {
+            fill.classList.add('indet');
+            const spd = speedNow(current);
+            statsEl.textContent = spd > 0.01
+                ? fmtMB(current) + '  ·  ' + spd.toFixed(1) + ' ' + t('loadSpeed')
+                : fmtMB(current);
+        }
+    }
+
+    function stats(text) { if (!visible) show(); statsEl.textContent = text; }
+
+    function hint(text) { if (!visible) show(); hintEl.textContent = text; }
+
+    function retrying(attempt) {
+        if (!visible) show();
+        statsEl.textContent = t('loadRetryChunk').replace('%1%', String(attempt));
+    }
+
+    function stall() { hint(t('loadStall')); }
+
+    function engineStatus(text) {
+        if (!visible || !engineMode) return;
+        statsEl.textContent = text;
+    }
+
+    function engineReady() {
+        if (!visible || !engineMode) return;
+        hide();
+    }
+
+    function error(err) {
+        ensure();
+        show();
+        engineMode = false;
+        if (engineWatchdog) { clearTimeout(engineWatchdog); engineWatchdog = null; }
+        root.classList.add('vc-err');
+        phaseEl.textContent = t('loadErrorTitle');
+        hintEl.textContent = t('downloadFailed');
+        const msg = err && err.message ? err.message : (err ? String(err) : '');
+        statsEl.textContent = msg ? msg.slice(0, 160) : '';
+    }
+
+    return { show, hide, phase, progress, stats, hint, retrying, stall, engineStatus, engineReady, error };
+})();
+
+/**
+ * Wait until the server can actually serve the game data:
+ *  - archive itself still downloading/indexing (legacy REVCDOS_DOWNLOAD=1 mode)
+ *  - remote-mode engine-file warm-up (the ~61 MB upstream pull) in progress
+ * Both surface as the "warm" overlay phase with live progress.
+ */
+async function waitForServerData() {
+    const started = Date.now();
+    let idleTicks = 0;
+    let warmKicked = 0;
+    for (;;) {
+        let st = null;
+        try {
+            const res = await fetch('/api/archive/status', { cache: 'no-store' });
+            if (res.ok) st = await res.json();
+        } catch (e) {
+            // Status endpoint unreachable — proceed; the download paths below
+            // will surface a proper error if the archive is truly unavailable.
+            console.warn('[loadData] archive status poll failed:', e && e.message ? e.message : e);
+            return;
+        }
+        if (!st) return;
+
+        if (st.state === 'error') {
+            throw new Error(st.error || 'server archive unavailable');
+        }
+
+        if (st.state === 'downloading' || st.state === 'indexing') {
+            const pct = st.state === 'indexing' ? 100 : (st.progress || 0);
+            LoadingUI.phase('warm');
+            LoadingUI.stats(t('serverPreparing').replace('%1%', String(pct)));
+            await sleep(1500);
+            continue;
+        }
+
+        if (st.state === 'idle') {
+            idleTicks++;
+            if (idleTicks === 1) {
+                // Ensure preparation is kicked off even if the status bar
+                // component has not fired its own prepare call yet.
+                fetch('/api/archive/prepare', { method: 'POST' }).catch(() => {});
+            }
+            if (idleTicks > 20) return; // ~30 s without starting — give up gracefully
+            LoadingUI.phase('connect');
+            await sleep(1500);
+            continue;
+        }
+
+        // state === 'ready': in remote mode the engine data (61 MB) may still
+        // be warming from upstream — waiting here means the chunked download
+        // afterwards runs at full speed instead of timing out its probe.
+        const w = st.warm && st.warm.data;
+        if (w && w.phase !== 'done' && w.phase !== 'error') {
+            if (Date.now() - started > 300000) return; // 5 min bound — try anyway
+            if (w.phase === 'idle') {
+                warmKicked++;
+                if (warmKicked === 1) {
+                    fetch('/api/archive/warm', { method: 'POST' }).catch(() => {});
+                }
+                if (warmKicked > 5) return; // warm-up not engaging — try the download
+                LoadingUI.phase('warm');
+            } else if (w.phase === 'downloading' && w.total > 0) {
+                LoadingUI.phase('warm');
+                LoadingUI.progress(w.received, w.total);
+            } else if (w.phase === 'decompressing') {
+                LoadingUI.phase('warm');
+                LoadingUI.stats(t('loadDecompress'));
+            } else { // pending
+                LoadingUI.phase('warm');
+            }
+            await sleep(1000);
+            continue;
+        }
+        return; // ready + warm done / absent / failed — proceed to download
+    }
 }
 
 async function loadData() {
@@ -366,46 +748,20 @@ async function loadData() {
         console.error('Failed to open cache:', e);
     }
 
-    // On a freshly booted (published) container the server-side 1.08 GB
-    // archive may still be downloading/indexing. Wait for it to become ready
-    // instead of failing the game data download, and surface the preparation
-    // progress on the game status line so the player knows what is going on.
-    try {
-        let idleTicks = 0;
-        for (;;) {
-            const res = await fetch('/api/archive/status', { cache: 'no-store' });
-            if (!res.ok) break;
-            const st = await res.json();
-            if (!st || st.state === 'ready' || st.state === 'error') break;
-            if (st.state === 'idle') {
-                idleTicks++;
-                if (idleTicks === 1) {
-                    // Ensure preparation is kicked off even if the status bar
-                    // component has not fired its own prepare call yet.
-                    fetch('/api/archive/prepare', { method: 'POST' }).catch(() => {});
-                }
-                if (idleTicks > 20) break; // ~30s without starting — give up gracefully
-            } else {
-                const pct = st.state === 'indexing' ? 100 : (st.progress || 0);
-                setStatus(t("serverPreparing").replace('%1%', String(pct)));
-            }
-            await sleep(1500);
-        }
-    } catch (e) {
-        // Status endpoint unreachable — proceed; the download paths below
-        // will surface a proper error if the archive is truly unavailable.
-        console.warn('[loadData] archive status poll failed:', e && e.message ? e.message : e);
-    }
+    // Server-side readiness (archive download / remote-mode warm-up), with
+    // the progress surfaced on the full-screen overlay.
+    await waitForServerData();
 
     // Preferred: chunked ranged download — resilient against proxies that
     // truncate or stall long responses, retryable per chunk.
     try {
+        LoadingUI.phase('connect');
         const total = await probeStoredSize(data_content);
         if (total > 0) {
-            setStatus(`Downloading...(0/${total})`);
+            LoadingUI.phase('download');
             const data = await downloadChunked(data_content, total, (received, tot) => {
-                setStatus(`Downloading...(${received}/${tot})`);
-            });
+                LoadingUI.progress(received, tot);
+            }, (attempt) => LoadingUI.retrying(attempt));
             if (data) {
                 if (cache) {
                     try {
@@ -421,18 +777,32 @@ async function loadData() {
         console.warn('[loadData] chunked download failed, falling back to streamed fetch:', e && e.message ? e.message : e);
     }
 
-    // Fallback: original single-stream fetch.
-    const data = await downloadStreamed(data_content, (receivedLength) => {
-        setStatus(`Downloading...(${receivedLength}/${dataSize})`);
-    });
-    if (cache) {
+    // Fallback: original single-stream fetch, now with a stall watchdog and
+    // whole-file retries — a stalled stream no longer hangs behind a black
+    // screen forever.
+    let lastErr;
+    for (let attempt = 1; attempt <= 3; attempt++) {
         try {
-            await cache.put(data_content, new Response(data.buffer, { headers: { 'Content-Type': 'application/octet-stream' } }));
-        } catch (e) {
-            console.error('Failed to cache data:', e.message);
+            if (attempt > 1) LoadingUI.retrying(attempt);
+            else LoadingUI.phase('download');
+            const data = await downloadStreamed(data_content, (receivedLength) => {
+                LoadingUI.progress(receivedLength);
+            });
+            if (cache) {
+                try {
+                    await cache.put(data_content, new Response(data.buffer, { headers: { 'Content-Type': 'application/octet-stream' } }));
+                } catch (e) {
+                    console.error('Failed to cache data:', e.message);
+                }
+            }
+            return data;
+        } catch (err) {
+            lastErr = err;
+            console.warn(`[loadData] streamed attempt ${attempt}/3 failed:`, err && err.message ? err.message : err);
+            if (attempt < 3) await sleep(1500);
         }
     }
-    return data;
+    throw lastErr;
 };
 
 async function startGame(e) {
@@ -448,7 +818,11 @@ async function startGame(e) {
     document.querySelector('.click-to-play').style.display = 'none';
     loaderContainer.style.display = "flex";
     introContainer.hidden = false;
-    intro.play();
+    intro.play().catch(() => { /* autoplay rejection is non-fatal */ });
+
+    // Full-screen loading overlay — every phase from here until the engine
+    // boots reports visible progress (see LoadingUI above).
+    LoadingUI.phase('connect');
 
     let dataBuffer;
     try {
@@ -456,10 +830,12 @@ async function startGame(e) {
     } catch (err) {
         console.error('[loadData] fatal:', err);
         spinnerElement.hidden = true;
-        setStatus(t("downloadFailed"));
         progressElement.hidden = true;
-        throw err;
+        setStatus(t("downloadFailed"));
+        LoadingUI.error(err);
+        return; // the overlay's retry button owns the recovery UX now
     }
+    LoadingUI.hide();
     spinnerElement.hidden = true;
     setStatus(t("clickToContinue"));
     introContainer.hidden = false;
@@ -467,7 +843,11 @@ async function startGame(e) {
     const clickHandler = () => {
         intro.pause();
         introContainer.style.display = 'none';
-        loadGame(dataBuffer);
+        // Engine boot: keep the overlay up ("Starting the engine" → wasm
+        // download → "Preparing...") until the game actually renders, so the
+        // black canvas between click and first frame is never feedback-less.
+        LoadingUI.phase('engine');
+        setTimeout(() => loadGame(dataBuffer), 60);
     };
     if (isMobile) {
         window.addEventListener('pointerup', clickHandler, { once: true });
@@ -480,6 +860,9 @@ function setStatus(text) {
     if (!text) {
         progressElement.hidden = true;
         spinnerElement.hidden = true;
+        // The engine reports an empty status once the runtime is up — retire
+        // the loading overlay then (the game is rendering).
+        LoadingUI.engineReady();
         return;
     }
     const match = text.match(/(.+)\((\d+\.?\d*)\/(\d+)\)/);
@@ -498,6 +881,10 @@ function setStatus(text) {
     } else {
         statusElement.textContent = text;
     }
+    // Engine boot messages ("Preparing... (x/y)" etc.) surface on the
+    // overlay too — the intro container (and its status line) is hidden at
+    // that point, which used to leave a black, feedback-less screen.
+    LoadingUI.engineStatus(text);
 };
 
 async function loadGame(data) {
@@ -509,6 +896,9 @@ async function loadGame(data) {
             } catch (e) {
                 console.error('mainCalled error:', e);
             }
+            // Engine main() is alive — first frames render within seconds;
+            // retire the loading overlay then.
+            setTimeout(() => LoadingUI.hide(), 2500);
         },
         syncRevcIni: () => {
             try {
@@ -563,13 +953,17 @@ async function loadGame(data) {
             try {
                 const total = await probeStoredSize(wasmUrl);
                 if (total > 0) {
-                    const bytes = await downloadChunked(wasmUrl, total, null);
+                    LoadingUI.phase('wasm');
+                    const bytes = await downloadChunked(wasmUrl, total, (received, tot) => {
+                        LoadingUI.progress(received, tot);
+                    }, (attempt) => LoadingUI.retrying(attempt));
                     if (isWasmMagic(bytes)) return bytes;
                     console.warn('[wasm] chunked payload failed magic check, falling back');
                 }
             } catch (e) {
                 console.warn('[wasm] chunked load failed, falling back:', e && e.message ? e.message : e);
             }
+            LoadingUI.phase('wasm');
             // Fallback: plain fetch with retries. The browser decodes
             // Content-Encoding: br transparently; if a proxy stripped the
             // header but not the bytes, decompress as a last resort.
@@ -594,6 +988,7 @@ async function loadGame(data) {
             throw lastErr;
         };
         const wasmBytes = await loadWasmBytes();
+        LoadingUI.phase('engine');
         const module = await WebAssembly.instantiate(wasmBytes, info);
         return receiveInstance(module.instance, module);
     };
@@ -615,6 +1010,10 @@ async function loadGame(data) {
     const script = document.createElement('script');
     script.async = true;
     script.src = '/game/index.js';
+    script.onerror = () => {
+        console.error('[loadGame] failed to load /game/index.js');
+        LoadingUI.error(new Error('Failed to load /game/index.js'));
+    };
     document.body.appendChild(script);
 
     document.body.classList.add('gameIsStarted');
