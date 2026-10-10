@@ -19,7 +19,53 @@ import { Readable } from 'node:stream'
 import { readFile } from 'node:fs/promises'
 import type { ArchiveStats } from './packed-archive'
 
-const MAX_RAW_CACHE_BYTES = 128 * 1024 * 1024
+/**
+ * Best-effort container memory limit (cgroup v2 → v1 → os.totalmem).
+ * Returns 0 when unknown. Published containers report a low value and the
+ * caller downgrades its in-memory caches accordingly.
+ */
+export function detectContainerMemoryLimit(): number {
+  const readNum = (p: string): number => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports
+      const fs = require('node:fs') as typeof import('node:fs')
+      const raw = fs.readFileSync(p, 'utf-8').trim()
+      const n = Number(raw)
+      return Number.isFinite(n) ? n : 0
+    } catch {
+      return 0
+    }
+  }
+  // cgroup v2: "max" means unlimited → NaN → 0.
+  let limit = readNum('/sys/fs/cgroup/memory.max')
+  if (limit > 0 && limit < 1 << 50) return limit
+  // cgroup v1.
+  limit = readNum('/sys/fs/cgroup/memory/memory.limit_in_bytes')
+  if (limit > 0 && limit < 1 << 50) return limit
+  return 0
+}
+
+/** True when the runtime environment reports a small memory budget. */
+export function isLowMemoryEnvironment(): boolean {
+  const limit = detectContainerMemoryLimit()
+  if (limit > 0) return limit < 1.5 * 1024 * 1024 * 1024
+  try {
+    return require('node:os').totalmem() < 1.5 * 1024 * 1024 * 1024
+  } catch {
+    return false
+  }
+}
+
+const LOW_MEMORY = isLowMemoryEnvironment()
+
+// Raw-byte LRU budget. Low-memory containers shrink it hard — the big engine
+// package is no longer cached raw anyway (see RAW_CACHE_FILE_MAX), so this
+// budget only holds the long tail of small assets.
+const MAX_RAW_CACHE_BYTES = LOW_MEMORY ? 16 * 1024 * 1024 : 128 * 1024 * 1024
+/** Files larger than this (compressed) are never kept in the raw LRU. */
+const RAW_CACHE_FILE_MAX = 4 * 1024 * 1024
+/** Files larger than this (compressed) should be materialised to disk. */
+export const DISK_MATERIALIZATION_THRESHOLD = 4 * 1024 * 1024
 const MAX_CONCURRENT_FETCHES = 16
 // Timeout scales with the range size: small assets get ~30 s, the ~61 MB
 // engine data package gets up to 10 minutes (slow upstream links must not
@@ -190,6 +236,15 @@ export class RemoteArchive {
     const normalized = path.replace(/^\/+/, '').replace(/\/+/g, '/')
     const e = this.entries.get(normalized)
     return e ? { dataOffset: e[0], compressedSize: e[1] } : null
+  }
+
+  /** Whether this backend wants large files materialised to disk (remote mode).
+   * Published containers are small-RAM: keeping the ~135 MB decompressed
+   * engine package (plus its ~58 MB compressed raw form) resident in memory
+   * OOM-kills the process — see DISK_MATERIALIZATION_THRESHOLD. */
+  wantsDiskMaterialization(path: string): boolean {
+    const entry = this.resolve(path)
+    return !!entry && entry.compressedSize > DISK_MATERIALIZATION_THRESHOLD
   }
 
   /** Relay partitions exposed to clients (the /api/archive/sources route). */
@@ -397,15 +452,19 @@ export class RemoteArchive {
     let p = this.inflight.get(path)
     if (!p) {
       p = this.fetchRange(path, entry.dataOffset, entry.compressedSize).then((buf) => {
-        this.rawCache.set(path, buf)
-        let used = 0
-        for (const b of this.rawCache.values()) used += b.length
-        while (used > MAX_RAW_CACHE_BYTES && this.rawCache.size > 1) {
-          const oldest = this.rawCache.keys().next().value
-          if (oldest === undefined) break
-          const b = this.rawCache.get(oldest)
-          this.rawCache.delete(oldest)
-          used -= b ? b.length : 0
+        // Large files (engine data package) are streamed straight through and
+        // never enter the raw LRU — caching them would pin ~60 MB RAM per file.
+        if (buf.length <= RAW_CACHE_FILE_MAX) {
+          this.rawCache.set(path, buf)
+          let used = 0
+          for (const b of this.rawCache.values()) used += b.length
+          while (used > MAX_RAW_CACHE_BYTES && this.rawCache.size > 1) {
+            const oldest = this.rawCache.keys().next().value
+            if (oldest === undefined) break
+            const b = this.rawCache.get(oldest)
+            this.rawCache.delete(oldest)
+            used -= b ? b.length : 0
+          }
         }
         return buf
       })

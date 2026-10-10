@@ -7,11 +7,18 @@
  * /vcsky and /vcbr route handlers.
  */
 
-import { createWriteStream, statSync, mkdirSync, readFileSync } from 'node:fs'
+import { createWriteStream, statSync, mkdirSync, readFileSync, createReadStream, renameSync, rmSync } from 'node:fs'
 import { mkdir, readFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+import { Readable } from 'node:stream'
 import { PackedArchive, type ArchiveStats } from './packed-archive'
-import { RemoteArchive, parseRelaySources, type RelaySourceConfig } from './remote-archive'
+import {
+  RemoteArchive,
+  parseRelaySources,
+  type RelaySourceConfig,
+  isLowMemoryEnvironment,
+  detectContainerMemoryLimit,
+} from './remote-archive'
 
 /**
  * Common serving surface for local (PackedArchive) and remote (RemoteArchive)
@@ -22,6 +29,8 @@ export interface ArchiveSource {
   resolve(path: string): { dataOffset: number; compressedSize: number } | null
   streamRaw(path: string): ReadableStream<Uint8Array> | null
   streamDecompressed(path: string): ReadableStream<Uint8Array> | null
+  /** Remote backends request disk materialisation for large files (OOM guard). */
+  wantsDiskMaterialization?(path: string): boolean
   close(): Promise<void>
 }
 
@@ -537,31 +546,114 @@ async function pipeTo(
 /**
  * Materialised (decompressed) view of archive files for ranged serving.
  *
- * Files are stream-decompressed ONCE on their first ranged request and kept
- * in an LRU cache capped at MAX_MATERIALIZED_BYTES. The data package is
- * ~135 MB decompressed and the wasm ~8 MB, so both fit comfortably while the
- * total stays bounded regardless of request patterns.
+ * Two backing stores, chosen per file:
+ *  - MEMORY LRU (small files): stream-decompressed once on first request,
+ *    kept capped at MAX_MATERIALIZED_BYTES.
+ *  - DISK materialisation (large engine files, remote backend): the ~135 MB
+ *    decompressed package is streamed to <dir>/<escaped>.tmp and renamed into
+ *    place; ranged requests then slice it with createReadStream — bounded RAM
+ *    in ANY container. Guards against the OOM that killed small published
+ *    containers (gateway 502 → unresponsive site) when the whole package,
+ *    its compressed raw form and the assembly copy were all held in memory.
  */
-const MAX_MATERIALIZED_BYTES = 192 * 1024 * 1024
+const LOW_MEMORY = isLowMemoryEnvironment()
+const MAX_MATERIALIZED_BYTES = LOW_MEMORY ? 24 * 1024 * 1024 : 192 * 1024 * 1024
+/** Free disk bytes required before enabling disk materialisation. */
+const DISK_MAT_MIN_FREE = 160 * 1024 * 1024
+
+type MaterializedRef =
+  | { kind: 'mem'; buf: Uint8Array }
+  | { kind: 'disk'; filePath: string; size: number }
 
 interface MaterializedGlobal {
   lru: Map<string, Uint8Array>
-  inflight: Map<string, Promise<Uint8Array>>
+  disk: Map<string, { filePath: string; size: number }>
+  inflight: Map<string, Promise<MaterializedRef>>
 }
 
 const mg = globalThis as typeof globalThis & { __revcdosMaterialized?: MaterializedGlobal }
 if (!mg.__revcdosMaterialized) {
-  mg.__revcdosMaterialized = { lru: new Map(), inflight: new Map() }
+  mg.__revcdosMaterialized = { lru: new Map(), disk: new Map(), inflight: new Map() }
 }
 
-function getMaterialized(arc: ArchiveSource, entryPath: string): Promise<Uint8Array> {
+function matFileName(entryPath: string): string {
+  return entryPath.replace(/[^a-zA-Z0-9._-]+/g, '__')
+}
+
+interface DiskMatDirGlobal {
+  resolved?: string | null
+}
+const dg = globalThis as typeof globalThis & { __revcdosMatDir?: DiskMatDirGlobal }
+
+function diskFreeBytes(dir: string): number {
+  try {
+    const fs = require('node:fs') as typeof import('node:fs') & {
+      statfsSync?: (p: string) => { bavail: number; bsize: number }
+    }
+    if (typeof fs.statfsSync !== 'function') return Infinity
+    const st = fs.statfsSync(dir)
+    const free = Number(st.bavail) * Number(st.bsize)
+    return Number.isFinite(free) && free > 0 ? free : Infinity
+  } catch {
+    return Infinity
+  }
+}
+
+/**
+ * Resolve the disk-materialisation directory (once per process): prefer
+ * <cwd>/.revcdos-mat, fall back to /tmp/revcdos-mat. Returns null when no
+ * candidate can guarantee the min free budget — LOW_MEMORY environments then
+ * refuse large-file requests instead of OOM-ing (see materialize).
+ */
+function resolveMatDir(): string | null {
+  const store = dg.__revcdosMatDir ?? (dg.__revcdosMatDir = {})
+  if (store.resolved !== undefined) return store.resolved
+  const candidates = [`${process.cwd()}/.revcdos-mat`, '/tmp/revcdos-mat']
+  for (const dir of candidates) {
+    try {
+      mkdirSync(dir, { recursive: true })
+      const free = diskFreeBytes(dir)
+      if (free !== Infinity && free < DISK_MAT_MIN_FREE) continue
+      store.resolved = dir
+      const memLimit = detectContainerMemoryLimit()
+      console.log(
+        `[archive] disk materialisation dir: ${dir} (free ${(free / 1048576).toFixed(0)} MiB, ` +
+          `memory limit ${memLimit > 0 ? `${(memLimit / 1048576).toFixed(0)} MiB` : 'unknown'})`,
+      )
+      return dir
+    } catch {
+      /* try next candidate */
+    }
+  }
+  store.resolved = null
+  console.warn(
+    '[archive] disk materialisation unavailable — large files will be refused in low-memory mode',
+  )
+  return null
+}
+
+function getMaterialized(arc: ArchiveSource, entryPath: string): Promise<MaterializedRef> {
   const store = mg.__revcdosMaterialized!
   const cached = store.lru.get(entryPath)
   if (cached) {
     // Refresh LRU recency.
     store.lru.delete(entryPath)
     store.lru.set(entryPath, cached)
-    return Promise.resolve(cached)
+    return Promise.resolve({ kind: 'mem', buf: cached })
+  }
+  const diskEntry = store.disk.get(entryPath)
+  if (diskEntry) {
+    try {
+      if (statSync(diskEntry.filePath).size === diskEntry.size) {
+        return Promise.resolve({ kind: 'disk', ...diskEntry })
+      }
+      console.warn(
+        `[archive] disk materialised file size mismatch for ${entryPath} — rematerialising`,
+      )
+    } catch {
+      /* file vanished — rematerialise */
+    }
+    store.disk.delete(entryPath)
   }
   let inflight = store.inflight.get(entryPath)
   if (!inflight) {
@@ -581,9 +673,28 @@ async function materialize(
   arc: ArchiveSource,
   entryPath: string,
   store: MaterializedGlobal,
-): Promise<Uint8Array> {
+): Promise<MaterializedRef> {
   const stream = arc.streamDecompressed(entryPath)
   if (!stream) throw new Error(`File not found: ${entryPath}`)
+
+  // ---- Disk path: large engine files (OOM guard for published containers) ----
+  if (arc.wantsDiskMaterialization?.(entryPath) === true) {
+    const dir = resolveMatDir()
+    if (dir) {
+      const ref = await materializeToDisk(stream, entryPath, dir)
+      store.disk.set(entryPath, { filePath: ref.filePath, size: ref.size })
+      return { kind: 'disk', ...ref }
+    }
+    if (LOW_MEMORY) {
+      // Refusing beats OOM-killing the whole container (observed as gateway
+      // 502s followed by an unresponsive site on small published containers).
+      throw new Error(
+        `file ${entryPath} requires disk materialisation but no usable cache dir exists (low-memory mode)`,
+      )
+    }
+    // Ample-RAM environment without a disk dir: fall through to memory.
+  }
+
   const reader = stream.getReader()
   const chunks: Uint8Array[] = []
   let total = 0
@@ -618,7 +729,64 @@ async function materialize(
     store.lru.delete(oldest)
     used -= buf ? buf.length : 0
   }
-  return out
+  return { kind: 'mem', buf: out }
+}
+
+/**
+ * Stream-decompress a large archive entry straight to a cache file
+ * (tmp + atomic rename), never holding more than a few pipe buffers of RAM.
+ */
+async function materializeToDisk(
+  stream: ReadableStream<Uint8Array>,
+  entryPath: string,
+  dir: string,
+): Promise<{ filePath: string; size: number }> {
+  const reader = stream.getReader()
+  const target = join(dir, matFileName(entryPath))
+  const tmp = `${target}.tmp`
+  const ws = createWriteStream(tmp, { flags: 'w' })
+  const write = (chunk: Uint8Array) =>
+    new Promise<void>((resolve, reject) => {
+      ws.write(chunk as unknown as Buffer, (err) => (err ? reject(err) : resolve()))
+    })
+  let total = 0
+  let warmTouched = false
+  try {
+    for (;;) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (value) {
+        await write(value)
+        total += value.length
+      }
+      if (!warmTouched) {
+        warmTouched = true
+        touchWarmPhase(entryPath, 'decompressing')
+      }
+    }
+    await new Promise<void>((resolve, reject) => {
+      ws.on('error', reject)
+      ws.end(() => resolve())
+    })
+  } catch (err) {
+    reader.cancel().catch(() => {})
+    try {
+      ws.destroy()
+    } catch {
+      /* already closed */
+    }
+    try {
+      rmSync(tmp, { force: true })
+    } catch {
+      /* best effort */
+    }
+    throw err
+  }
+  renameSync(tmp, target)
+  console.log(
+    `[archive] materialised to disk: ${entryPath} → ${target} (${(total / 1048576).toFixed(1)} MiB)`,
+  )
+  return { filePath: target, size: total }
 }
 
 /**
@@ -676,19 +844,20 @@ export async function serveFromArchive(
   // download resilient against edges that truncate long streams.
   const rangeHeader = request.headers.get('range')
   if (rangeHeader) {
-    let data: Uint8Array
+    let ref: MaterializedRef
     try {
-      data = await getMaterialized(arc, entryPath)
+      ref = await getMaterialized(arc, entryPath)
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err)
       return new Response(`Failed to prepare file: ${message}`, { status: 500 })
     }
-    const range = parseRange(rangeHeader, data.length)
+    const totalLen = ref.kind === 'mem' ? ref.buf.length : ref.size
+    const range = parseRange(rangeHeader, totalLen)
     if (!range) {
       const headers = new Headers({
         ...baseHeaders,
         'Cache-Control': 'no-store',
-        'Content-Range': `bytes */${data.length}`,
+        'Content-Range': `bytes */${totalLen}`,
       })
       return new Response(null, { status: 416, headers })
     }
@@ -699,11 +868,26 @@ export async function serveFromArchive(
       // Partial responses must not be cached by shared intermediaries —
       // they are reassembled by the client and cached via the Cache API.
       'Cache-Control': 'no-store',
-      'Content-Range': `bytes ${start}-${end}/${data.length}`,
+      'Content-Range': `bytes ${start}-${end}/${totalLen}`,
       'Content-Length': String(length),
     })
     if (isHead) return new Response(null, { status: 206, headers })
-    return new Response(data.subarray(start, end + 1), { status: 206, headers })
+    if (ref.kind === 'mem') {
+      return new Response(ref.buf.subarray(start, end + 1) as unknown as BodyInit, {
+        status: 206,
+        headers,
+      })
+    }
+    // Disk-backed slice: stream straight off the materialised cache file —
+    // memory usage is a couple of pipe buffers regardless of file size.
+    try {
+      const nodeStream = createReadStream(ref.filePath, { start, end })
+      const body = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>
+      return new Response(body as unknown as BodyInit, { status: 206, headers })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return new Response(`Failed to read materialised file: ${message}`, { status: 500 })
+    }
   }
 
   // ---- Mode 2: brotli passthrough ----
