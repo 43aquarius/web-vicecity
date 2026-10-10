@@ -251,6 +251,36 @@ async function liveProxyRange(req, res, start, end) {
 
 // ------------------------------------------------------------- seeding ----
 
+/**
+ * Discard a response body WITHOUT buffering it: read at most maxBytes, then
+ * cancel (with a timeout escape hatch).
+ *
+ * Guards against an upstream that intermittently ignores Range and answers
+ * a ranged GET with HTTP 200 + the FULL 1.08 GB body (observed on
+ * folder.morgen.qzz.io) — a naive `res.arrayBuffer()` drain would buffer
+ * the whole archive into RAM and OOM the relay container.
+ */
+async function discardBody(res, maxBytes = 64 * 1024) {
+  try {
+    if (res.body) {
+      const reader = res.body.getReader()
+      let received = 0
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        received += value.byteLength
+        if (received >= maxBytes) break
+      }
+      await Promise.race([
+        reader.cancel().catch(() => {}),
+        new Promise((resolve) => setTimeout(resolve, 3000)),
+      ])
+    }
+  } catch {
+    /* body already errored/closed — nothing to drain */
+  }
+}
+
 async function probeArchiveTotal() {
   try {
     const res = await fetch(CFG.archiveUrl, {
@@ -258,7 +288,14 @@ async function probeArchiveTotal() {
       signal: AbortSignal.timeout(30_000),
     })
     const cr = res.headers.get('content-range') || ''
-    await res.arrayBuffer().catch(() => {})
+    if (res.status === 206) {
+      // 1-byte body — tiny drain is safe.
+      await res.arrayBuffer().catch(() => {})
+    } else {
+      // 200 full-body on a ranged probe — discard BOUNDED (never
+      // arrayBuffer: that buffers the whole 1.08 GB archive → OOM).
+      await discardBody(res)
+    }
     const total = Number(cr.split('/')[1] || 0)
     if (total > 0) {
       archiveTotal = total
@@ -306,26 +343,6 @@ async function seedPartition() {
     return
   }
 
-  // Disk pre-check: the full partition plus a write margin must be free,
-  // otherwise seeding would fill the disk mid-download. When it fails we
-  // stay in 'error' state and keep SERVING via the live proxy (still fully
-  // functional, just uncached) instead of wrecking the host filesystem.
-  try {
-    const fsStats = await fsp.statfs(CFG.dataDir)
-    const freeBytes = Number(fsStats.bavail) * Number(fsStats.bsize)
-    const needBytes = PART_SIZE + 64 * 1024 * 1024
-    if (freeBytes < needBytes) {
-      seedState = 'error'
-      seedError =
-        `insufficient disk (${(freeBytes / 1048576).toFixed(0)} MiB free, ` +
-        `need ~${(needBytes / 1048576).toFixed(0)} MiB) — serving via live proxy`
-      console.error(`[relay] ${seedError}`)
-      return
-    }
-  } catch {
-    /* statfs unavailable on this platform — proceed optimistically */
-  }
-
   if (finalSize > 0 && finalSize !== PART_SIZE) {
     console.warn('[relay] part.bin size mismatch — reseeding from scratch')
     await fsp.rm(PART_FILE, { force: true })
@@ -336,6 +353,29 @@ async function seedPartition() {
     await fsp.rm(TMP_FILE, { force: true })
     done = 0
   }
+
+  // Resume-aware disk pre-check: only the REMAINING bytes (plus a write
+  // margin) must be free — an existing part.bin.tmp prefix already holds
+  // `done` bytes on disk and seeding APPENDS to it. When even that fails we
+  // stay in 'error' state and keep SERVING via the live proxy (still fully
+  // functional, just uncached) instead of wrecking the host filesystem.
+  try {
+    const fsStats = await fsp.statfs(CFG.dataDir)
+    const freeBytes = Number(fsStats.bavail) * Number(fsStats.bsize)
+    const needBytes = PART_SIZE - done + 64 * 1024 * 1024
+    if (freeBytes < needBytes) {
+      seedState = 'error'
+      seedError =
+        `insufficient disk (${(freeBytes / 1048576).toFixed(0)} MiB free, ` +
+        `need ~${(needBytes / 1048576).toFixed(0)} MiB to finish seeding ` +
+        `${((PART_SIZE - done) / 1048576).toFixed(0)} MiB more) — serving via live proxy`
+      console.error(`[relay] ${seedError}`)
+      return
+    }
+  } catch {
+    /* statfs unavailable on this platform — proceed optimistically */
+  }
+
   seededBytes = done
   console.log(
     `[relay] seeding partition [${CFG.partStart}, ${CFG.partEnd}) (${PART_SIZE} bytes) — resume @ ${done}`,
@@ -353,7 +393,9 @@ async function seedPartition() {
         signal: AbortSignal.timeout(Math.min(600_000, 120_000 + want * 5)),
       })
       if (res.status !== 206) {
-        await res.arrayBuffer().catch(() => {})
+        // Bounded discard — an arrayBuffer() drain of a Range-ignoring 200
+        // would buffer the full 1.08 GB archive into RAM (OOM).
+        await discardBody(res)
         throw new Error(`upstream HTTP ${res.status} for seed range`)
       }
       const buf = Buffer.from(await res.arrayBuffer())
