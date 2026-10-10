@@ -83,9 +83,48 @@ interface FlatIndex {
 }
 
 /**
+ * Discard a response body WITHOUT buffering it.
+ *
+ * A naive `res.arrayBuffer()` drain buffers whatever the server sends — and
+ * when the upstream intermittently ignores Range (observed on
+ * folder.morgen.qzz.io: a ranged GET is answered with HTTP 200 + the FULL
+ * 1.08 GB body), that drains the entire archive into RAM and OOM-kills small
+ * published containers (whole-site 502). `body.cancel()` alone can hang
+ * under some fetch implementations, so we read at most `maxBytes`, cancel
+ * with a timeout escape hatch, then hard-abort the request via `ctrl`.
+ */
+export async function discardBody(
+  res: Response,
+  ctrl?: AbortController,
+  maxBytes = 64 * 1024,
+): Promise<void> {
+  try {
+    const body = res.body
+    if (body) {
+      const reader = body.getReader()
+      let received = 0
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        received += value.byteLength
+        if (received >= maxBytes) break
+      }
+      await Promise.race([
+        reader.cancel().catch(() => {}),
+        new Promise<void>((resolve) => setTimeout(resolve, 3000)),
+      ])
+    }
+  } catch {
+    /* body already errored/closed — nothing to drain */
+  } finally {
+    ctrl?.abort()
+  }
+}
+
+/**
  * Drain a 206 response body as a Buffer, reporting received bytes along the
  * way so multi-MB engine-file fetches surface real progress (arrayBuffer()
- * gives no intermediate signal).
+ * gives no intermediate signal). Throws on over-read (Range ignored).
  */
 async function readBodyWithProgress(
   res: Response,
@@ -104,6 +143,15 @@ async function readBodyWithProgress(
     const b = Buffer.from(value)
     chunks.push(b)
     received += b.length
+    // Over-read guard: the remote sent MORE than the requested range. This
+    // is the streamed variant of a Range-ignoring 200 — bail out instead of
+    // buffering an unbounded body.
+    if (received > expectedLength) {
+      await reader.cancel().catch(() => {})
+      throw new Error(
+        `upstream over-read: ${received} > ${expectedLength} bytes (Range ignored?)`,
+      )
+    }
     onProgress(received)
   }
   if (chunks.length === 1 && received === expectedLength) return chunks[0]
@@ -290,8 +338,12 @@ export class RemoteArchive {
           signal: AbortSignal.timeout(Math.max(RELAY_TIMEOUT_MS, Math.min(600_000, 10_000 + length * 20))),
         })
         if (res.status !== 206) {
-          await res.arrayBuffer().catch(() => {})
-          throw new Error(`relay ${relay.id} returned HTTP ${res.status}`)
+          const status = res.status
+          // CRITICAL: never arrayBuffer() a non-206 body — when the relay or
+          // its gateway answers 200 with a full/HMTL body this would buffer
+          // it all. Discard bounded, then abort.
+          await discardBody(res)
+          throw new Error(`relay ${relay.id} returned HTTP ${status}`)
         }
         const buf = await readBodyWithProgress(res, length, (received) => {
           if (this.onRawProgress) this.onRawProgress(path, received, length)
@@ -397,23 +449,44 @@ export class RemoteArchive {
           await new Promise<void>((resolve) => this.fetchQueue.push(resolve))
         }
         this.activeFetches++
+        // AbortController (instead of AbortSignal.timeout) so the non-206
+        // path can hard-abort a Range-ignoring 200 response immediately —
+        // the old 10-minute signal gave an arrayBuffer() drain time to
+        // buffer the full 1.08 GB archive and OOM-kill the container.
+        const ctrl = new AbortController()
+        const timeoutMs = Math.min(MAX_FETCH_TIMEOUT_MS, 30_000 + length * 20)
+        const timer = setTimeout(() => ctrl.abort(), timeoutMs)
         try {
-          const timeoutMs = Math.min(MAX_FETCH_TIMEOUT_MS, 30_000 + length * 20)
           const res = await fetch(this.archiveUrl, {
             headers: { Range: `bytes=${offset}-${offset + length - 1}` },
             // Do NOT set Accept-Encoding — the CDN ignores Range for identity.
-            signal: AbortSignal.timeout(timeoutMs),
+            signal: ctrl.signal,
           })
           if (res.status !== 206) {
-            await res.arrayBuffer().catch(() => {})
-            throw new Error(`upstream returned HTTP ${res.status} for range ${offset}+${length}`)
+            const status = res.status
+            // CRITICAL OOM guard: when the upstream ignores the Range header
+            // it answers 200 with the FULL 1.08 GB archive. Draining via
+            // arrayBuffer() here OOM-killed small published containers
+            // (whole-site 502). Discard bounded, then hard-abort.
+            await discardBody(res, ctrl)
+            throw new Error(`upstream returned HTTP ${status} for range ${offset}+${length}`)
           }
           // Guard against a silently replaced upstream archive: a total-size
           // mismatch means the bundled index no longer matches the bytes.
           const total = Number((res.headers.get('content-range') ?? '').split('/')[1] ?? 0)
           if (this.expectedSize > 0 && total > 0 && total !== this.expectedSize) {
+            await discardBody(res, ctrl)
             throw new Error(
               `upstream archive size mismatch: index expects ${this.expectedSize}, upstream has ${total} (stale index)`,
+            )
+          }
+          // Fail fast when the edge announces a different length than asked
+          // (misrouted/ignored range) — before pulling any body bytes.
+          const announced = Number(res.headers.get('content-length') ?? 0)
+          if (announced > 0 && announced !== length) {
+            await discardBody(res, ctrl)
+            throw new Error(
+              `upstream content-length ${announced} != requested ${length} at offset ${offset}`,
             )
           }
           const buf = await readBodyWithProgress(res, length)
@@ -422,6 +495,7 @@ export class RemoteArchive {
           }
           return buf
         } finally {
+          clearTimeout(timer)
           this.activeFetches--
           const next = this.fetchQueue.shift()
           if (next) next()

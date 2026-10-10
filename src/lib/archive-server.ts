@@ -15,6 +15,7 @@ import { PackedArchive, type ArchiveStats } from './packed-archive'
 import {
   RemoteArchive,
   parseRelaySources,
+  discardBody,
   type RelaySourceConfig,
   isLowMemoryEnvironment,
   detectContainerMemoryLimit,
@@ -452,8 +453,10 @@ async function init(): Promise<ArchiveSource> {
 
 async function probeRemoteSize(): Promise<number> {
   // A Range GET (rather than HEAD) survives CDN header normalization and
-  // reports the total size via Content-Range. Always drain the tiny body via
-  // arrayBuffer() — body.cancel() can hang under some fetch implementations.
+  // reports the total size via Content-Range. The 206 body is a single byte
+  // (safe tiny drain); a 200 answer means the upstream is ignoring Range —
+  // discard BOUNDED via discardBody (an arrayBuffer() drain would buffer
+  // the full 1.08 GB archive and OOM small containers).
   const res = await fetch(ARCHIVE_URL, {
     headers: { Range: 'bytes=0-0' },
     signal: AbortSignal.timeout(30_000),
@@ -461,11 +464,14 @@ async function probeRemoteSize(): Promise<number> {
   if (!res.ok && res.status !== 206) {
     throw new Error(`Probe ${ARCHIVE_URL} -> ${res.status}`)
   }
-  await res.arrayBuffer().catch(() => {})
   if (res.status === 206) {
     const contentRange = res.headers.get('content-range') ?? ''
     const total = Number(contentRange.split('/')[1] ?? 0)
+    await res.arrayBuffer().catch(() => {})
     if (total > 0) return total
+  } else {
+    // 200 full-body on a ranged probe — Range is (currently) ignored.
+    await discardBody(res)
   }
   const len = Number(res.headers.get('content-length') ?? 0)
   if (len > 1) return len
@@ -479,7 +485,13 @@ async function remoteSupportsRange(): Promise<boolean> {
       signal: AbortSignal.timeout(30_000),
     })
     const ok = res.status === 206
-    await res.arrayBuffer().catch(() => {})
+    if (ok) {
+      // 1-byte body — tiny drain is safe.
+      await res.arrayBuffer().catch(() => {})
+    } else {
+      // 200 full-body — discard BOUNDED (never arrayBuffer: OOM).
+      await discardBody(res)
+    }
     return ok
   } catch {
     return false
