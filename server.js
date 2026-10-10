@@ -101,7 +101,7 @@ const TMP_FILE = PART_FILE + '.tmp'
 const startedAt = Date.now()
 /** Bytes of the partition already on disk (part.bin or seeded prefix of .tmp). */
 let seededBytes = 0
-/** 'seeding' | 'ready' | 'error' */
+/** 'seeding' | 'ready' | 'error' ('error' + liveFallback still SERVES via live proxy) */
 let seedState = 'seeding'
 let seedError = ''
 /** Archive total size: config default (known), refined by the upstream probe. */
@@ -110,7 +110,9 @@ let stats = { requests: 0, bytesServed: 0, liveServed: 0, rangeServed: 0, reject
 
 function health() {
   return {
-    ok: seedState === 'ready',
+    // ok = the relay can serve archive requests right now: either the local
+    // disk cache is complete, or seeding aborted but live fallback is on.
+    ok: seedState === 'ready' || (CFG.liveFallback && seedState === 'error'),
     id: CFG.id,
     relay: 'web-vicecity',
     part: { start: CFG.partStart, end: CFG.partEnd, size: PART_SIZE },
@@ -210,9 +212,17 @@ async function liveProxyRange(req, res, start, end) {
       res.end(`relay live fetch failed: ${err.message}`)
       return
     }
-    if (upstream.status !== 206 && upstream.status !== 200) {
+    if (upstream.status !== 206) {
+      // Upstream ignored the Range header (some CDNs/edges do). NEVER pipe a
+      // 200 full stream back to a ranged request — that would answer a
+      // 100-byte ask with the whole 1.08 GB archive. Fail loudly instead so
+      // callers fall back to another source.
+      await upstream.body?.cancel().catch(() => {})
       res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' })
-      res.end(`relay live fetch failed: upstream HTTP ${upstream.status}`)
+      res.end(
+        `relay live fetch failed: upstream returned HTTP ${upstream.status} ` +
+          'for a Range request (Range header ignored upstream)',
+      )
       return
     }
     const headers = {}
@@ -262,6 +272,13 @@ async function probeArchiveTotal() {
   }
 }
 
+/** The file currently holding the seeded bytes: part.bin once complete,
+ *  part.bin.tmp while seeding (or after an aborted seed — its prefix is
+ *  still a valid local slice source). */
+function seededFile() {
+  return seedState === 'ready' ? PART_FILE : TMP_FILE
+}
+
 async function ensureDir() {
   await fsp.mkdir(CFG.dataDir, { recursive: true })
 }
@@ -288,6 +305,27 @@ async function seedPartition() {
     console.log(`[relay] partition already complete: ${PART_SIZE} bytes`)
     return
   }
+
+  // Disk pre-check: the full partition plus a write margin must be free,
+  // otherwise seeding would fill the disk mid-download. When it fails we
+  // stay in 'error' state and keep SERVING via the live proxy (still fully
+  // functional, just uncached) instead of wrecking the host filesystem.
+  try {
+    const fsStats = await fsp.statfs(CFG.dataDir)
+    const freeBytes = Number(fsStats.bavail) * Number(fsStats.bsize)
+    const needBytes = PART_SIZE + 64 * 1024 * 1024
+    if (freeBytes < needBytes) {
+      seedState = 'error'
+      seedError =
+        `insufficient disk (${(freeBytes / 1048576).toFixed(0)} MiB free, ` +
+        `need ~${(needBytes / 1048576).toFixed(0)} MiB) — serving via live proxy`
+      console.error(`[relay] ${seedError}`)
+      return
+    }
+  } catch {
+    /* statfs unavailable on this platform — proceed optimistically */
+  }
+
   if (finalSize > 0 && finalSize !== PART_SIZE) {
     console.warn('[relay] part.bin size mismatch — reseeding from scratch')
     await fsp.rm(PART_FILE, { force: true })
@@ -376,7 +414,7 @@ code{color:#ffe08a}
 <div>${h.id} · 分区 [${h.part.start}, ${h.part.end}) · ${(h.part.size / 1048576).toFixed(1)} MiB</div>
 <div class="bar"><div></div></div>
 <table>
-<tr><td>状态</td><td>${h.state === 'ready' ? '✅ 就绪' : h.state === 'seeding' ? '⏳ 预下载中 ' + pct + '%' : '❌ ' + h.state + ' ' + (h.seedError || '')}</td></tr>
+<tr><td>状态</td><td>${h.state === 'ready' ? '✅ 就绪' : h.state === 'seeding' ? '⏳ 预下载中 ' + pct + '%' : h.liveFallback ? '⚡ 实时代理模式（缓存不可用：' + (h.seedError || h.state) + '）' : '❌ ' + h.state + ' ' + (h.seedError || '')}</td></tr>
 <tr><td>已缓存</td><td>${(h.seeded / 1048576).toFixed(1)} / ${(h.part.size / 1048576).toFixed(1)} MiB</td></tr>
 <tr><td>回源兜底</td><td>${h.liveFallback ? '开启（分区外/未就绪请求实时代理上游）' : '关闭'}</td></tr>
 <tr><td>鉴权</td><td>${h.tokenRequired ? '需要 token' : '开放（CORS *）'}</td></tr>
@@ -417,7 +455,7 @@ function serveLocalSlice(req, res, start, end) {
     res.end()
     return
   }
-  const stream = fs.createReadStream(PART_FILE, { start: start - CFG.partStart, end: end - CFG.partStart })
+  const stream = fs.createReadStream(seededFile(), { start: start - CFG.partStart, end: end - CFG.partStart })
   stream.on('error', (err) => {
     console.error('[relay] local read failed:', err.message)
     res.destroy()
@@ -555,22 +593,28 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // Inside partition but not yet seeded up to `end` → live proxy this range.
-  if (CFG.liveFallback && seedState === 'seeding' && end >= CFG.partStart + seededBytes) {
-    relayHeaders(res, 'live-while-seeding')
-    await liveProxyRange(req, res, start, end)
-    return
-  }
-
-  // Seeded prefix only.
-  if (start + (end - start + 1) <= CFG.partStart + seededBytes) {
+  // Seeded prefix fully covers the range → local slice (from part.bin once
+  // complete, or the growing part.bin.tmp while seeding).
+  if (end < CFG.partStart + seededBytes) {
     relayHeaders(res, 'local')
     serveLocalSlice(req, res, start, Math.min(end, CFG.partStart + seededBytes - 1))
     return
   }
 
+  // Not locally available (seeding in progress, or seeding impossible —
+  // e.g. insufficient disk) → live proxy this range from upstream, so the
+  // relay keeps serving correct 206s in EVERY state, not just while a
+  // first seed download runs.
+  if (CFG.liveFallback) {
+    relayHeaders(res, seedState === 'seeding' ? 'live-while-seeding' : 'live-unseeded')
+    await liveProxyRange(req, res, start, end)
+    return
+  }
+
   res.writeHead(503, { 'Content-Type': 'text/plain; charset=utf-8' })
-  res.end(`not seeded to this offset yet (${seededBytes}/${PART_SIZE}); retry later`)
+  res.end(
+    `not seeded to this offset yet (${seededBytes}/${PART_SIZE}) and live fallback off; retry later`,
+  )
 })
 
 // ----------------------------------------------------------------- main ----
