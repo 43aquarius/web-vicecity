@@ -812,3 +812,13 @@ body.gameIsStarted {
 .click-to-play button {
     -webkit-touch-callout: none;
 }
+
+/* CRITICAL for the direct camera-drag layer: without touch-action none the
+ * browser claims the gesture for panning/zooming after a few pixels and
+ * fires pointercancel — the camera drag would die mid-swipe on real phones
+ * (emulators never show this). #look is the camera drag zone; #move is the
+ * walk joystick zone. */
+#look,
+#move {
+    touch-action: none;
+}

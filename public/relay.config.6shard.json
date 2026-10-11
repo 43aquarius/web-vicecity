@@ -1,0 +1,4 @@
+{
+  "_readme": "六分片中继配置（目标态，覆盖 1.08GB 全档，主站转为纯兜底）。边界设计：a/b 各自对半切分；尾段切分点 987212548 特意落在引擎大文件 vc-sky-en-v6.data.br [956754376, 1017670720) 的正中，使初次进入的 ~61MB 引擎数据由 c、d 两台中继并行各拉一半，而不是全部压在一台。使用方法：4 台新中继（a2/b2/c/d，见 download/6分片部署指南.md）部署并验证 206 之后，把本文件内容替换进 public/relay.config.json，再在平台点“重新发布”。可分阶段启用：先只加 c+d（初次进入收益的绝大部分），a2/b2 之后随时补。",
+  "REVCDOS_RELAYS": "a=https://vicecity-relay-a.space-z.ai/revcdos.bin:0-180727453,a2=https://vicecity-relay-a2.space-z.ai/revcdos.bin:180727453-361454906,b=https://vicecity-relay-b.space-z.ai/revcdos.bin:361454906-542182359,b2=https://vicecity-relay-b2.space-z.ai/revcdos.bin:542182359-722909812,c=https://vicecity-relay-c.space-z.ai/revcdos.bin:722909812-987212548,d=https://vicecity-relay-d.space-z.ai/revcdos.bin:987212548-1084364719"
+}

@@ -1051,8 +1051,15 @@ var fillMouseEventData = (eventStruct, e, target) => {
     HEAP8[eventStruct + 27] = e.metaKey;
     HEAP16[idx * 2 + 14] = e.button;
     HEAP16[idx * 2 + 15] = e.buttons;
-    HEAP32[idx + 8] = e["movementX"];
-    HEAP32[idx + 9] = e["movementY"];
+    // Synthetic camera-look events (touch drag → game.js injectLookMouse)
+    // carry the finger delta in custom __vcDX/__vcDY props. The MouseEvent
+    // init dict's movementX/movementY is IGNORED by some engines (WebKit
+    // bug: constructor drops them) — real mouse events fall through to the
+    // standard properties, synthetic ones use the bulletproof custom path.
+    var __vdx = (e && typeof e["__vcDX"] === "number") ? e["__vcDX"] : null;
+    var __vdy = (e && typeof e["__vcDY"] === "number") ? e["__vcDY"] : null;
+    HEAP32[idx + 8] = (__vdx !== null) ? __vdx : (e["movementX"] || e["mozMovementX"] || e["webkitMovementX"] || 0);
+    HEAP32[idx + 9] = (__vdy !== null) ? __vdy : (e["movementY"] || e["mozMovementY"] || e["webkitMovementY"] || 0);
     var rect = getBoundingClientRect(target);
     HEAP32[idx + 10] = e.clientX - (rect.left | 0);
     HEAP32[idx + 11] = e.clientY - (rect.top | 0)

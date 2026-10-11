@@ -41,7 +41,6 @@ if (!(lookSens >= 1 && lookSens <= 10)) {
     if (!(lookSens >= 1 && lookSens <= 10)) lookSens = 7;
 }
 try { localStorage.setItem('vcsky.lookSens', String(lookSens)); } catch (e) { /* private mode */ }
-const lookDragDistance = Math.round(160 - lookSens * 12);
 
 const dataSize = 130 * 1024 * 1024;
 const textDecoder = new TextDecoder();
@@ -77,7 +76,7 @@ const translations = {
         loadWasmTitle: "Downloading engine core",
         loadEngineTitle: "Starting the engine",
         loadEngineHint: "The first start compiles the engine — this may take up to a minute.",
-        touchHint: "Touch controls: the FIST button (bottom-right) is also the FIRE button — punch when bare-handed, shoot when armed. A red crosshair FIRE button appears next to JUMP whenever you are armed. Look: press and drag anywhere on the right half of the screen; keep sliding to keep rotating.",
+        touchHint: "Touch controls: the FIST button (bottom-right) is also the FIRE button — punch when bare-handed, shoot when armed. A red crosshair FIRE button appears next to JUMP whenever you are armed. Camera: touch and drag anywhere on the right half of the screen — like every 3D mobile game, the camera follows your finger.",
         loadEngineSlow: "The engine is taking longer than usual. If nothing happens for a while, reload the page to retry.",
         loadErrorTitle: "Load failed",
         loadRetry: "Retry",
@@ -127,7 +126,7 @@ const translations = {
         loadWasmTitle: "Загрузка ядра движка",
         loadEngineTitle: "Запуск движка",
         loadEngineHint: "Первый запуск компилирует движок — это может занять до минуты.",
-        touchHint: "Сенсорное управление: кнопка с кулаком — это и кнопка ОГОНЬ: удар кулаком или выстрел. При оружии рядом с кнопкой прыжка появляется красная кнопка огня (перекрестие). Обзор: удерживайте и ведите палец по правой половине экрана.",
+        touchHint: "Сенсорное управление: кнопка с кулаком — это и кнопка ОГОНЬ: удар кулаком или выстрел. При оружии рядом с кнопкой прыжка появляется красная кнопка огня (перекрестие). Камера: коснитесь правой половины экрана и ведите палец — камера следует за пальцем.",
         loadEngineSlow: "Запуск занимает больше обычного. Если ничего не происходит, обновите страницу.",
         loadErrorTitle: "Ошибка загрузки",
         loadRetry: "Повторить",
@@ -186,7 +185,7 @@ const translations = {
         loadWasmTitle: "正在下载引擎核心",
         loadEngineTitle: "正在启动游戏引擎",
         loadEngineHint: "首次启动需要编译引擎，可能需要一分钟左右。",
-        touchHint: "触屏操作：持枪时跳跃键旁会出现红色准星开火键（拳头键同样可开火）。视角：按住右半屏拖动即可转动镜头，手指可沿方向持续滑动。",
+        touchHint: "触屏操作：持枪时跳跃键旁会出现红色准星开火键（拳头键同样可开火）。视角：像常见 3D 手游一样，按住右半屏任意位置拖动，镜头随手转动。",
         loadEngineSlow: "启动耗时比预期久；若长时间无响应，可刷新页面重试。",
         loadErrorTitle: "加载失败",
         loadRetry: "重试",
@@ -764,6 +763,24 @@ const LoadingUI = (() => {
  *  - remote-mode engine-file warm-up (the ~61 MB upstream pull) in progress
  * Both surface as the "warm" overlay phase with live progress.
  */
+
+// ---- SW materialisation progress → REAL bytes on the loading bar ------
+// The SW streams/materialises the big engine file BEFORE serving the 4 MB
+// chunks (which then fly 0→100% in seconds from worker memory). During that
+// materialisation the SW posts cumulative byte counts — they are the only
+// real progress signal for the longest phase of a first visit, and they
+// carry a total (server stream) or just a live MB counter (unknown length).
+let matProgressPath = null; // 'vcbr/<file>' while a phase waits on the SW
+if (navigator.serviceWorker) {
+    navigator.serviceWorker.addEventListener('message', (ev) => {
+        const d = ev && ev.data;
+        if (!d || d.type !== 'vc-mat-progress' || !matProgressPath) return;
+        if (d.path !== matProgressPath) return;
+        if (d.total > 0) LoadingUI.progress(d.received, d.total);
+        else LoadingUI.progress(d.received); // unknown total → live MB + speed
+    });
+}
+
 async function waitForServerData() {
     const started = Date.now();
     let idleTicks = 0;
@@ -826,10 +843,19 @@ async function waitForServerData() {
                 LoadingUI.progress(w.received, w.total);
             } else if (w.phase === 'decompressing') {
                 LoadingUI.phase('warm');
-                // Decompress is the last warm step before "done": show it as
-                // near-complete rather than an empty indeterminate bar.
-                LoadingUI.progressPct(96);
-                LoadingUI.stats(t('loadDecompress'));
+                // REAL decompression progress: bytes produced vs the known
+                // final decompressed size (the old UI parked on a fake 96%
+                // here, which could sit still for up to a minute).
+                const decTotal = w.decompressTotal || 0;
+                if (decTotal > 0 && w.decompressed) {
+                    const pct = Math.min(99.5, (w.decompressed / decTotal) * 100);
+                    LoadingUI.progressPct(pct);
+                    LoadingUI.stats(t('loadDecompress') + ' · ' + Math.floor(pct) + '% · '
+                        + (w.decompressed / 1000000).toFixed(1) + ' / ' + (decTotal / 1000000).toFixed(1) + ' MB');
+                } else {
+                    LoadingUI.progressPct(0); // honest: nothing measurable yet
+                    LoadingUI.stats(t('loadDecompress'));
+                }
             } else { // pending
                 LoadingUI.phase('warm');
                 LoadingUI.progressPct(2);
@@ -860,7 +886,13 @@ async function loadData() {
     // Preferred: chunked ranged download — resilient against proxies that
     // truncate or stall long responses, retryable per chunk.
     try {
-        LoadingUI.phase('connect');
+        // The probe triggers the SW's materialisation of the ~135 MB engine
+        // file — the longest transfer of a first visit. Its live byte count
+        // arrives via the SW message listener and drives the bar, so go to
+        // the download phase right away (real numbers replace the old
+        // frozen 0% + instant 0→100% jump).
+        matProgressPath = data_content.startsWith('/vcbr/') ? data_content.slice(1) : null;
+        LoadingUI.phase('download');
         const total = await probeStoredSize(data_content);
         if (total > 0) {
             LoadingUI.phase('download');
@@ -1057,6 +1089,11 @@ async function loadGame(data) {
             // Preferred: small ranged chunks so a proxy truncating long
             // responses cannot break the engine; each chunk is retryable.
             try {
+                // Set the phase BEFORE the probe: the probe waits for the
+                // SW's materialisation of the engine core (its byte
+                // progress streams in via the SW message listener).
+                matProgressPath = wasmUrl.startsWith('/vcbr/') ? wasmUrl.slice(1) : null;
+                LoadingUI.phase('wasm');
                 const total = await probeStoredSize(wasmUrl);
                 if (total > 0) {
                     LoadingUI.phase('wasm');
@@ -1138,74 +1175,147 @@ async function loadGame(data) {
         invertY: false,
     };
     emulator.AddDisplayJoystickEventListeners(0, [gamepadEmulatorConfig]);
-    const gamepadEmulatorConfig1 = {
-        directions: { up: true, down: true, left: true, right: true },
-        // Camera look: sensitivity-tuned drag distance (lookDragDistance
-        // below) + followDrag so the finger can keep sliding past the
-        // saturation radius to rotate continuously without re-touching.
-        dragDistance: lookDragDistance,
-        followDrag: true,
-        tapTarget: look,
-        lockTargetWhilePressed: true,
-        xAxisIndex: 2,
-        yAxisIndex: 3,
-        swapAxes: false,
-        invertX: false,
-        invertY: false,
-    };
-    emulator.AddDisplayJoystickEventListeners(0, [gamepadEmulatorConfig1]);
+
+    // NOTE: there is deliberately NO second joystick on the right half any
+    // more. The engine binds the right stick on foot to VC's first-person
+    // look actions (PED_1RST_PERSON_LOOK_*), so a "camera stick" made every
+    // drag dive the camera into Tommy's head. Camera control is now a
+    // DIRECT touch-drag → mouse-delta injection (see installTouchLook below)
+    // — exactly how every 3D mobile game handles look.
 
     // ------------------------------------------------------------------
-    // On-foot camera mode fix: in this engine the RIGHT STICK on foot is
-    // bound to PED_1RST_PERSON_LOOK_* (VC's first-person look mode), so a
-    // touch camera drag used to dive the camera into the player's head —
-    // "the view switched from 3rd to 1st person". Route on-foot camera
-    // drags to PC-style MOUSE movement instead: reVC orbits the camera
-    // behind the player (3rd person), exactly like the desktop controls.
-    // Vehicles / aiming scopes keep the stick path (turret + aim look).
+    // Touch camera look — DIRECT DRAG (the "every 3D mobile game" model).
+    //
+    // A touch anywhere on the right half of the screen (#look) drags the
+    // camera exactly like a desktop mouse: each pointermove injects the
+    // finger's DELTA into the engine's mouse pipeline. No virtual stick, no
+    // saturation radius, no re-anchoring — pure 1:1 relative movement, so
+    // the third-person camera orbits behind Tommy and NEVER switches to the
+    // engine's first-person look mode (that mode is bound to the right
+    // STICK, which we no longer feed). Multi-touch safe: the pointer that
+    // started on #look owns the camera; the left-thumb move joystick is a
+    // different pointerId. Works in vehicles and aiming scopes too — full
+    // PC mouse parity (Method=0).
     // ------------------------------------------------------------------
-    const LOOK_MOUSE_GAIN = 12;   // px of look injected per move event at
-    const LOOK_MOUSE_GAIN_Y = 0.7; // full deflection (horizontal / vertical)
-    const lookMouseActive = () => {
-        const ds = document.body.dataset;
-        return ds.stateCar !== '1'
-            && ds.stateMenu !== '1'
-            && ds.stateCutscene !== '1'
-            && ds.stateScopeMode !== '1'
-            && ds.stateScopeGun !== '1'
-            && ds.stateDisableControls !== '1'
-            && ds.stateDownload !== '1';
-    };
+    const LOOK_GAIN = Math.max(0.5, 0.55 + lookSens * 0.15); // sens 7 → 1.6
+    const LOOK_GAIN_Y = 0.62; // vertical is damped: pitch has a smaller travel
+    // Deltas are delivered via __vcDX/__vcDY custom props (patched into
+    // fillMouseEventData) — movementX in the MouseEvent init dict is
+    // silently DROPPED by WebKit/iOS Safari, which is why the previous
+    // joystick→mousemove bridge produced zero camera movement on real
+    // phones while working fine in desktop Chromium.
+    let lookCX = Math.round(innerWidth / 2);
+    let lookCY = Math.round(innerHeight / 2);
+    window.__vcLookDebug = { events: 0, dx: 0, dy: 0, blockedBy: '', active: false };
     const injectLookMouse = (dx, dy) => {
-        // Synthetic mousemove carrying EXACT movementX/Y, dispatched at the
-        // CANVAS: the engine (Emscripten mousemove callback) listens on the
-        // canvas element only — body/document dispatches never reach it.
-        // fillMouseEventData passes e.movementX/Y straight into the engine,
-        // immune to the coordinate-differencing that compatibility mouse
-        // events would otherwise cause.
+        const canvas = document.getElementById('canvas');
+        if (!canvas) return;
+        dx = Math.round(dx);
+        dy = Math.round(dy);
+        if (!dx && !dy) return;
+        // Keep the synthetic cursor coherent: clientX/Y advance by the same
+        // delta, so any consumer (movementX reader OR clientX-differencing)
+        // sees consistent motion.
+        lookCX = Math.min(innerWidth + 200, Math.max(-200, lookCX + dx));
+        lookCY = Math.min(innerHeight + 200, Math.max(-200, lookCY + dy));
         const ev = new MouseEvent('mousemove', {
             bubbles: true,
             cancelable: true,
-            clientX: Math.round(innerWidth / 2),
-            clientY: Math.round(innerHeight / 2),
-            movementX: Math.round(dx),
-            movementY: Math.round(dy),
+            clientX: lookCX,
+            clientY: lookCY,
+            movementX: dx,
+            movementY: dy,
         });
-        (document.getElementById('canvas') || document.body).dispatchEvent(ev);
+        ev.__vcDX = dx;
+        ev.__vcDY = dy;
+        window.__vcLookDebug.events++;
+        window.__vcLookDebug.dx = dx;
+        window.__vcLookDebug.dy = dy;
+        canvas.dispatchEvent(ev);
     };
-    const origMoveAxis = emulator.MoveAxis.bind(emulator);
-    emulator.MoveAxis = (gamepadIndex, axisIndex, value) => {
-        const isLookAxis = axisIndex === 2 || axisIndex === 3;
-        if (isLookAxis && lookMouseActive()) {
-            const dx = axisIndex === 2 ? value * LOOK_MOUSE_GAIN : 0;
-            const dy = axisIndex === 3 ? value * LOOK_MOUSE_GAIN * LOOK_MOUSE_GAIN_Y : 0;
-            injectLookMouse(dx, dy);
-            // keep the virtual right stick neutral on foot so the engine's
-            // first-person look never engages from a camera drag
-            return origMoveAxis(gamepadIndex, axisIndex, 0);
-        }
-        return origMoveAxis(gamepadIndex, axisIndex, value);
+    // Inject only while the player actually controls the camera. Vehicles,
+    // bikes and aiming scopes ARE mouse-controlled on PC (Method=0), so
+    // they stay enabled; menus/cutscenes/downloads are not.
+    const lookMouseActive = () => {
+        const ds = document.body.dataset;
+        if (ds.stateMenu === '1') { window.__vcLookDebug.blockedBy = 'menu'; return false; }
+        if (ds.stateCutscene === '1') { window.__vcLookDebug.blockedBy = 'cutscene'; return false; }
+        if (ds.stateDownload === '1') { window.__vcLookDebug.blockedBy = 'download'; return false; }
+        if (ds.stateDisableControls === '1') { window.__vcLookDebug.blockedBy = 'disabled'; return false; }
+        window.__vcLookDebug.blockedBy = '';
+        return true;
     };
+    const installTouchLook = () => {
+        const zone = document.getElementById('look');
+        if (!zone) return;
+        let lookPointer = -1;
+        let lastX = 0;
+        let lastY = 0;
+        // pointermove/up/cancel are listened at DOCUMENT level and filtered by
+        // pointerId: with pointer capture the events retarget to #look and
+        // bubble up here; without capture (some engines reject it) they still
+        // arrive; synthetic test dispatches at document reach us too.
+        const onMove = (e) => {
+            if (e.pointerId !== lookPointer) return;
+            const dx = e.clientX - lastX;
+            const dy = e.clientY - lastY;
+            lastX = e.clientX;
+            lastY = e.clientY;
+            if ((dx || dy) && lookMouseActive()) {
+                injectLookMouse(dx * LOOK_GAIN, dy * LOOK_GAIN * LOOK_GAIN_Y);
+            }
+            e.preventDefault();
+        };
+        const endLook = (e) => {
+            if (e.pointerId !== lookPointer) return;
+            lookPointer = -1;
+            window.__vcLookDebug.active = false;
+            document.removeEventListener('pointermove', onMove, false);
+            document.removeEventListener('pointerup', endLook, false);
+            document.removeEventListener('pointercancel', endLook, false);
+        };
+        zone.addEventListener('pointerdown', (e) => {
+            if (lookPointer !== -1) return; // one camera finger at a time
+            lookPointer = e.pointerId;
+            lastX = e.clientX;
+            lastY = e.clientY;
+            window.__vcLookDebug.active = true;
+            document.addEventListener('pointermove', onMove, false);
+            document.addEventListener('pointerup', endLook, false);
+            document.addEventListener('pointercancel', endLook, false);
+            // Capture keeps pointermove flowing even when the finger drifts
+            // over buttons; failure is non-fatal (the document listeners
+            // above keep the drag alive either way).
+            try { zone.setPointerCapture(e.pointerId); } catch (err) { /* capture unavailable */ }
+            e.preventDefault();
+        });
+        // Belt & suspenders for iOS legacy touch event flow: without a
+        // touchstart preventDefault Safari may start a native gesture and
+        // cancel the pointer stream mid-drag.
+        zone.addEventListener('touchstart', (e) => e.preventDefault(), { passive: false });
+    };
+    if (isTouch) installTouchLook();
+
+    // ?vcdebug=1 — tiny overlay for on-device diagnosis of the camera layer
+    // (drag state, injected event count, last delta, blocking reason, engine
+    // state flags). Purely additive; zero cost when the param is absent.
+    if (params.get('vcdebug') === '1') {
+        const hud = document.createElement('div');
+        hud.style.cssText = 'position:fixed;top:8px;left:8px;z-index:2147483600;font:11px/1.5 monospace;color:#7cffb0;background:rgba(0,0,0,.6);padding:6px 9px;border-radius:6px;pointer-events:none;white-space:pre;';
+        document.body.appendChild(hud);
+        setInterval(() => {
+            const ds = document.body.dataset;
+            const dbg = window.__vcLookDebug || {};
+            hud.textContent =
+                'look: ' + (dbg.active ? 'DRAG' : '-') +
+                '  ev=' + (dbg.events || 0) + '  d=' + (dbg.dx || 0) + ',' + (dbg.dy || 0) +
+                (dbg.blockedBy ? '  blk=' + dbg.blockedBy : '') + '\n' +
+                'menu=' + (ds.stateMenu || 0) + ' cut=' + (ds.stateCutscene || 0) +
+                ' car=' + (ds.stateCar || 0) + ' gun=' + (ds.stateGun || 0) +
+                ' scope=' + (ds.stateScopeMode || 0) + ' dl=' + (ds.stateDownload || 0) +
+                ' dis=' + (ds.stateDisableControls || 0);
+        }, 400);
+    }
 
     emulator.AddDisplayButtonEventListeners(0, [{
         buttonIndex: 9,

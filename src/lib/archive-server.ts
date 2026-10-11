@@ -148,6 +148,8 @@ export interface WarmEntry {
   /** Received raw (compressed) bytes — meaningful while phase='downloading'. */
   received: number
   total: number
+  /** Decompressed bytes produced so far — meaningful while phase='decompressing'. */
+  decompressed?: number
   error?: string
 }
 
@@ -211,12 +213,24 @@ if (!g.__revcdosArchive) {
 const WARM_DATA_PATH = 'vcbr/vc-sky-en-v6.data.br'
 const WARM_WASM_PATH = 'vcbr/vc-sky-en-v6.wasm.br'
 
+/**
+ * Known final DECOMPRESSED sizes of the warm files (stable for this archive
+ * build — measured from the ranged-serving totals). They turn the
+ * 'decompressing' warm phase into a REAL percentage: bytes produced ÷ final
+ * size. The launcher's loading bar reads them via /api/archive/status
+ * (decompressTotal in the snapshot).
+ */
+const WARM_EXPECTED_DECOMPRESSED: Record<string, number> = {
+  [WARM_DATA_PATH]: 135_355_111,
+  [WARM_WASM_PATH]: 7_625_877,
+}
+
 function warmEntry(path: string): WarmEntry {
   const store = g.__revcdosArchive!
   if (!store.warm) store.warm = new Map()
   let e = store.warm.get(path)
   if (!e) {
-    e = { phase: 'idle', received: 0, total: 0 }
+    e = { phase: 'idle', received: 0, total: 0, decompressed: 0 }
     store.warm.set(path, e)
   }
   return e
@@ -227,12 +241,28 @@ function touchWarmPhase(path: string, phase: WarmPhase): void {
   if (e && e.phase !== 'done' && e.phase !== 'error') e.phase = phase
 }
 
-function snapshotWarm(): { data: WarmEntry; wasm: WarmEntry } | undefined {
+/** Decompression byte counter for the warm status (real progress). */
+function bumpWarmDecompressed(path: string, bytes: number): void {
+  if (!bytes || !(path in WARM_EXPECTED_DECOMPRESSED)) return
+  const e = g.__revcdosArchive?.warm?.get(path)
+  if (!e || e.phase === 'done' || e.phase === 'error') return
+  e.decompressed = (e.decompressed ?? 0) + bytes
+}
+
+function snapshotWarm():
+  | { data: WarmEntry & { decompressTotal?: number }; wasm: WarmEntry & { decompressTotal?: number } }
+  | undefined {
   const store = g.__revcdosArchive
   if (!store?.warm) return undefined
   return {
-    data: { ...store.warm.get(WARM_DATA_PATH) ?? { phase: 'idle', received: 0, total: 0 } },
-    wasm: { ...store.warm.get(WARM_WASM_PATH) ?? { phase: 'idle', received: 0, total: 0 } },
+    data: {
+      decompressTotal: WARM_EXPECTED_DECOMPRESSED[WARM_DATA_PATH],
+      ...(store.warm.get(WARM_DATA_PATH) ?? { phase: 'idle', received: 0, total: 0 }),
+    },
+    wasm: {
+      decompressTotal: WARM_EXPECTED_DECOMPRESSED[WARM_WASM_PATH],
+      ...(store.warm.get(WARM_WASM_PATH) ?? { phase: 'idle', received: 0, total: 0 }),
+    },
   }
 }
 
@@ -316,6 +346,7 @@ export function warmArchive(): void {
         w.phase = 'pending'
         w.received = 0
         w.total = 0
+        w.decompressed = 0
         w.error = undefined
         getMaterialized(arc, path)
           .then(() => {
@@ -716,6 +747,7 @@ async function materialize(
     if (done) break
     chunks.push(value)
     total += value.length
+    bumpWarmDecompressed(entryPath, value.length)
     if (!warmTouched) {
       warmTouched = true
       // Raw bytes are in (raw fetch resolves before decompression starts for
@@ -770,6 +802,7 @@ async function materializeToDisk(
       if (value) {
         await write(value)
         total += value.length
+        bumpWarmDecompressed(entryPath, value.length)
       }
       if (!warmTouched) {
         warmTouched = true

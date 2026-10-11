@@ -150,9 +150,10 @@ function relaysCover(offset, length) {
 /**
  * Fetch [offset, offset+length) from the partitioned relays: split per owner,
  * fetch segments in parallel, verify each 206 + length, concatenate.
- * Throws on any failure (caller falls back to the mirror).
+ * onProgress(n) reports the COMBINED bytes received so far. Throws on any
+ * failure (caller falls back to the mirror).
  */
-async function fetchRelayRange(offset, length) {
+async function fetchRelayRange(offset, length, onProgress) {
   const segments = []
   let pos = offset
   const end = offset + length
@@ -166,6 +167,7 @@ async function fetchRelayRange(offset, length) {
   }
   if (pos < end) throw new Error('relays do not cover tail at ' + pos)
 
+  let combined = 0
   const fetched = await Promise.all(
     segments.map(async (seg) => {
       let lastErr = null
@@ -182,7 +184,14 @@ async function fetchRelayRange(offset, length) {
             await res.arrayBuffer().catch(() => {})
             throw new Error(`relay ${seg.relay.id} HTTP ${res.status}`)
           }
-          const b = new Uint8Array(await res.arrayBuffer())
+          // Per-attempt counter: a retried segment restarts its stream at 0,
+          // so feed the DELTA into the combined count (never double-count).
+          let segLast = 0
+          const b = await readAllBytes(res, onProgress ? (n) => {
+            combined += n - segLast
+            segLast = n
+            onProgress(combined)
+          } : null)
           if (b.length !== seg.length) {
             throw new Error(`relay ${seg.relay.id} short read ${b.length}/${seg.length}`)
           }
@@ -393,15 +402,63 @@ async function entryFor(path) {
   return idx.map.get(path) || null
 }
 
-/** Fetch the stored brotli bytes — relays first, then the mirror. */
-async function loadDecompressed(path) {
+// ---------- live progress broadcast to the page (LoadingUI) ----------
+// The launcher's overlay used to sit frozen at 0% while THIS worker
+// streamed/materialised the 135 MB engine file — the longest phase of a
+// first visit. The 4 MB chunk download that follows is served from worker
+// memory and jumps 0→100% in seconds, so the only honest way to a REAL
+// progress bar is byte-level progress straight off the source stream.
+// postProgress is throttled to ~5 messages/second; total=0 means "unknown
+// total" (the page shows a live MB counter + speed instead of a %).
+function postProgress(path, received, total) {
+  if (!received) return
+  const now = Date.now()
+  if (postProgress._at && now - postProgress._at < 200 && (total > 0 && received < total - 65536)) return
+  postProgress._at = now
+  self.clients
+    .matchAll()
+    .then((cls) => {
+      for (const c of cls) {
+        try {
+          c.postMessage({ type: 'vc-mat-progress', path, received, total })
+        } catch (e) { /* client gone — fine */ }
+      }
+    })
+    .catch(() => {})
+}
+
+/** Read a response fully, reporting cumulative byte counts as they arrive. */
+async function readAllBytes(res, onChunk) {
+  if (!res.body || !onChunk) return new Uint8Array(await res.arrayBuffer())
+  const reader = res.body.getReader()
+  const parts = []
+  let total = 0
+  for (;;) {
+    const { done, value } = await reader.read()
+    if (done) break
+    parts.push(value)
+    total += value.length
+    onChunk(total)
+  }
+  const out = new Uint8Array(total)
+  let o = 0
+  for (const p of parts) {
+    out.set(p, o)
+    o += p.length
+  }
+  return out
+}
+
+/** Fetch the stored brotli bytes — relays first, then the mirror.
+ * onProgress(n) receives the cumulative COMPRESSED byte count (relay path). */
+async function loadDecompressed(path, onProgress) {
   const entry = await entryFor(path)
   if (!entry) return null
   let br = null
   await ensureRelaySources()
   if (relaysCover(entry[0], entry[1])) {
     try {
-      br = await fetchRelayRange(entry[0], entry[1])
+      br = await fetchRelayRange(entry[0], entry[1], onProgress)
     } catch (err) {
       noteRelayFailure()
       console.warn('[sw] relay fetch failed, falling back to mirror:', err && err.message)
@@ -411,6 +468,7 @@ async function loadDecompressed(path) {
     br = await fetchMirrorRange(entry[0], entry[1])
     lastRangeSource = 'mirror'
   }
+  if (onProgress) onProgress(entry[1]) // decode follows; the pull is complete
   const brotli = await getBrotli()
   return brotli.decompress(br)
 }
@@ -445,8 +503,37 @@ function materialize(cacheKey, entryPath) {
       /* Cache API unavailable — continue */
     }
 
-    // SERVER-FIRST for the big engine bundles (.data.br, ~58 MB compressed):
-    // the server streams the FULLY DECOMPRESSED file from its disk
+    const entry = await entryFor(entryPath)
+
+    // ---- RELAY-FIRST for the big engine bundles (when relays cover them) ---
+    // Disk-seeded relays are fast, CORS-open 206 servers. Splitting the
+    // compressed pull per partition owner downloads data.br from 2-3 relays
+    // IN PARALLEL (see fetchRelayRange) — first-entry bytes leave the
+    // player's own servers instead of the main site, and the origin is
+    // never touched. Byte progress is broadcast (compressed scale).
+    // Falls back to server-first + mirror below when relays do not cover
+    // the entry (e.g. only [0, 723 MB) is relayed and the engine files live
+    // in the tail) or when the relay fetch fails.
+    try {
+      await ensureRelaySources()
+      if (entry && relaysCover(entry[0], entry[1])) {
+        try {
+          const data = await loadDecompressed(entryPath, (n) =>
+            postProgress(entryPath, n, entry[1]),
+          )
+          if (data && data.length > 0) {
+            postProgress(entryPath, entry[1], entry[1])
+            return data
+          }
+        } catch (err) {
+          noteRelayFailure()
+          console.warn('[sw] relay materialisation failed, falling back to server:', err && err.message)
+        }
+      }
+    } catch (e) { /* relays unavailable — server-first below */ }
+
+    // ---- SERVER-FIRST (decompressed stream, progress in RAW scale) -----
+    // The server streams the FULLY DECOMPRESSED file from its disk
     // materialisation, which /api/archive/warm starts heating the moment
     // the entry page opens. The GitHub raw mirror's bulk throughput is
     // unreliable on many networks (CN especially): pulling 58 MB from it
@@ -454,16 +541,34 @@ function materialize(cacheKey, entryPath) {
     // screen — the "sometimes it loads, sometimes it never does" bug.
     // A fetch() from inside the SW does NOT re-enter this worker's fetch
     // handler, so this goes straight to the server.
+    // The request is a Range: bytes=0- GET on purpose: browsers attach
+    // accept-encoding: br to plain GETs, which would hit the server's
+    // brotli-passthrough mode (content-length = COMPRESSED size while the
+    // decoded stream is 2.3× larger — progress would lie). A ranged request
+    // always answers 206 with Content-Range carrying the true DECOMPRESSED
+    // total, and never applies content encoding.
     try {
-      const entry = await entryFor(entryPath)
       if (entry && entry[1] > SERVER_FIRST_THRESHOLD) {
         const res = await fetch(new URL(cacheKey, self.location.origin), {
+          headers: { Range: 'bytes=0-' },
           cache: 'no-store',
           signal: AbortSignal.timeout(SERVER_FIRST_TIMEOUT_MS),
         })
-        if (res.ok && res.status === 200) {
-          const buf = new Uint8Array(await res.arrayBuffer())
+        if (res.ok && (res.status === 200 || res.status === 206)) {
+          let total = 0
+          const cr = res.headers.get('content-range') || ''
+          if (res.status === 206 && cr.includes('/')) total = Number(cr.split('/')[1]) || 0
+          if (!total) total = Number(res.headers.get('content-length')) || 0
+          // Guard against a proxy stripping Range (→ 200 brotli passthrough:
+          // decoded bytes outrun the compressed content-length): fall back
+          // to an honest total-less counter instead of a lying percentage.
+          let totalOk = total > 0
+          const buf = await readAllBytes(res, (n) => {
+            if (totalOk && n > total + 4096) totalOk = false
+            postProgress(entryPath, n, totalOk ? total : 0)
+          })
           if (buf.length > 0) {
+            postProgress(entryPath, buf.length, totalOk ? total || buf.length : 0)
             lastRangeSource = 'server'
             return buf
           }
