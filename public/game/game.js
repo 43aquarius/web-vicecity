@@ -64,6 +64,7 @@ const translations = {
         loadWasmTitle: "Downloading engine core",
         loadEngineTitle: "Starting the engine",
         loadEngineHint: "The first start compiles the engine — this may take up to a minute.",
+        touchHint: "Touch controls: the FIST button (bottom-right) is also the FIRE button — punch when bare-handed, shoot when armed.",
         loadEngineSlow: "The engine is taking longer than usual. If nothing happens for a while, reload the page to retry.",
         loadErrorTitle: "Load failed",
         loadRetry: "Retry",
@@ -113,6 +114,7 @@ const translations = {
         loadWasmTitle: "Загрузка ядра движка",
         loadEngineTitle: "Запуск движка",
         loadEngineHint: "Первый запуск компилирует движок — это может занять до минуты.",
+        touchHint: "Сенсорное управление: кнопка с кулаком (справа внизу) — это и кнопка ОГОНЬ: удар кулаком или выстрел.",
         loadEngineSlow: "Запуск занимает больше обычного. Если ничего не происходит, обновите страницу.",
         loadErrorTitle: "Ошибка загрузки",
         loadRetry: "Повторить",
@@ -171,6 +173,7 @@ const translations = {
         loadWasmTitle: "正在下载引擎核心",
         loadEngineTitle: "正在启动游戏引擎",
         loadEngineHint: "首次启动需要编译引擎，可能需要一分钟左右。",
+        touchHint: "触屏操作：右下角的拳头按钮就是开火键——空手时出拳，持枪时射击。",
         loadEngineSlow: "启动耗时比预期久；若长时间无响应，可刷新页面重试。",
         loadErrorTitle: "加载失败",
         loadRetry: "重试",
@@ -286,7 +289,10 @@ updateGameDataForLanguage(currentLanguage);
 // handle — and retry each chunk on failure. Falls back to the original
 // single-stream fetch when Range is not honoured.
 const DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024;
-const CHUNK_TIMEOUT_MS = 45000;
+// The first chunk of the big engine file waits for the SW's materialisation
+// (server-side disk materialisation on a cold container can take ~1 min);
+// in-flight dedup means later chunks are instant once it lands.
+const CHUNK_TIMEOUT_MS = 90000;
 const CHUNK_RETRIES = 5;
 
 function sleep(ms) {
@@ -341,7 +347,7 @@ async function brotliDecompress(bytes) {
 // attempt budget.
 async function probeStoredSize(url) {
     try {
-        const res = await fetchWithRetry(url, { Range: 'bytes=0-0' }, 5, 30000, 'probe', (attempt) => {
+        const res = await fetchWithRetry(url, { Range: 'bytes=0-0' }, 5, 60000, 'probe', (attempt) => {
             LoadingUI.phase('connect');
             LoadingUI.hint(t('loadConnectSlow'));
             LoadingUI.retrying(attempt);
@@ -560,6 +566,12 @@ const LoadingUI = (() => {
         samples = [];
         phaseEl.textContent = t(keys[0]);
         hintEl.textContent = keys[1] ? t(keys[1]) : '';
+        // On touch devices append the control mapping hint during the engine
+        // phase (read right before the game appears): many players never
+        // discovered that the fist button doubles as FIRE.
+        if (name === 'engine' && (isTouch || document.body.dataset.isTouch === '1')) {
+            hintEl.textContent = (hintEl.textContent ? hintEl.textContent + ' ' : '') + t('touchHint');
+        }
         statsEl.textContent = '';
         fill.classList.add('indet');
         fill.style.width = '38%';

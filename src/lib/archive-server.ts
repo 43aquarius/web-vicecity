@@ -917,10 +917,40 @@ export async function serveFromArchive(
     return new Response(stream, { status: 200, headers })
   }
 
-  // ---- Mode 3: streaming decompression (bounded memory) ----
+  // ---- Mode 3: materialised copy first, streaming decompression as fallback ----
   if (isHead) {
     const headers = new Headers({ ...baseHeaders })
     return new Response(null, { status: 200, headers })
+  }
+  // The whole-file GET used to ALWAYS re-run a full brotli decode (~40 s for
+  // the 58 MB engine package) even when the ranged-chunk path had already
+  // materialised the same file to disk. Serve the materialised copy first:
+  // mem ref → buffer; disk ref → straight read stream with Content-Length.
+  // Only when materialisation is unavailable (refused in low-memory mode,
+  // no usable cache dir) fall back to bounded streaming decompression.
+  let ref: MaterializedRef | null = null
+  try {
+    ref = await getMaterialized(arc, entryPath)
+  } catch {
+    ref = null
+  }
+  if (ref) {
+    if (ref.kind === 'mem') {
+      const headers = new Headers({
+        ...baseHeaders,
+        'Content-Length': String(ref.buf.length),
+      })
+      return new Response(ref.buf as unknown as BodyInit, { status: 200, headers })
+    }
+    try {
+      const nodeStream = createReadStream(ref.filePath)
+      const body = Readable.toWeb(nodeStream) as unknown as ReadableStream<Uint8Array>
+      const headers = new Headers({ ...baseHeaders, 'Content-Length': String(ref.size) })
+      return new Response(body as unknown as BodyInit, { status: 200, headers })
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return new Response(`Failed to read materialised file: ${message}`, { status: 500 })
+    }
   }
   const decompressed = await acquireDecompressSlot(arc, entryPath)
   if (decompressed === null) return new Response('File not found', { status: 404 })

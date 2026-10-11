@@ -423,6 +423,11 @@ async function loadDecompressed(path) {
 
 const materialized = new Map() // entryPath -> Promise<Uint8Array>
 
+/** Compressed entries above this size are fetched SERVER-FIRST (see materialize). */
+const SERVER_FIRST_THRESHOLD = 4 * 1024 * 1024
+/** The server may still be materialising on a cold container — wait it out. */
+const SERVER_FIRST_TIMEOUT_MS = 120_000
+
 function materialize(cacheKey, entryPath) {
   let p = materialized.get(entryPath)
   if (p) return p
@@ -437,8 +442,37 @@ function materialize(cacheKey, entryPath) {
         if (buf.length > 0) return buf
       }
     } catch (e) {
-      /* Cache API unavailable — continue to the mirror */
+      /* Cache API unavailable — continue */
     }
+
+    // SERVER-FIRST for the big engine bundles (.data.br, ~58 MB compressed):
+    // the server streams the FULLY DECOMPRESSED file from its disk
+    // materialisation, which /api/archive/warm starts heating the moment
+    // the entry page opens. The GitHub raw mirror's bulk throughput is
+    // unreliable on many networks (CN especially): pulling 58 MB from it
+    // regularly exceeded the launcher's chunk timeout and froze the loading
+    // screen — the "sometimes it loads, sometimes it never does" bug.
+    // A fetch() from inside the SW does NOT re-enter this worker's fetch
+    // handler, so this goes straight to the server.
+    try {
+      const entry = await entryFor(entryPath)
+      if (entry && entry[1] > SERVER_FIRST_THRESHOLD) {
+        const res = await fetch(new URL(cacheKey, self.location.origin), {
+          cache: 'no-store',
+          signal: AbortSignal.timeout(SERVER_FIRST_TIMEOUT_MS),
+        })
+        if (res.ok && res.status === 200) {
+          const buf = new Uint8Array(await res.arrayBuffer())
+          if (buf.length > 0) {
+            lastRangeSource = 'server'
+            return buf
+          }
+        }
+      }
+    } catch (e) {
+      /* server unreachable/slow — fall through to relays + mirror */
+    }
+
     const data = await loadDecompressed(entryPath)
     if (!data || data.length === 0) throw new Error(`not in archive index: ${entryPath}`)
     return data
