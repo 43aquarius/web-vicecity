@@ -756,8 +756,27 @@ class GamepadEmulator {
                                 const minY = config.directions[Direction.up] ? -1 : 0;
                                 const maxY = config.directions[Direction.down] ? 1 : 0;
 
-                                const deltaX = e.clientX - startPos.startX;
-                                const deltaY = e.clientY - startPos.startY;
+                                let deltaX = e.clientX - startPos.startX;
+                                let deltaY = e.clientY - startPos.startY;
+
+                                // followDrag ("walking finger"): when the stick
+                                // saturates (drag >= dragDistance), re-anchor the
+                                // drag origin under the finger so it can keep
+                                // sliding in the same direction — the axis stays
+                                // at full deflection and the camera keeps rotating
+                                // without lifting and re-touching. Moving the
+                                // finger back reverses smoothly because the origin
+                                // moved with it. Opt-in via config.followDrag.
+                                if (config.followDrag) {
+                                        const distance = Math.sqrt(deltaX * deltaX + deltaY * deltaY);
+                                        if (distance > config.dragDistance && distance > 0) {
+                                                const scale = config.dragDistance * 0.98 / distance;
+                                                startPos.startX = e.clientX - deltaX * scale;
+                                                startPos.startY = e.clientY - deltaY * scale;
+                                                deltaX = e.clientX - startPos.startX;
+                                                deltaY = e.clientY - startPos.startY;
+                                        }
+                                }
 
                                 let {
                                         x,
@@ -786,10 +805,16 @@ class GamepadEmulator {
                         startPos.startY = e.clientY;
                         activePointerId = e.pointerId;
 
+                        // Capture is best-effort: some engines (CDP-driven
+                        // tests, certain mobile browsers during gesture
+                        // start) reject it with InvalidStateError. Losing
+                        // capture only means boundary events are not
+                        // retargeted — the drag itself must keep working,
+                        // so NEVER let this throw abort the handler below.
                         if (config.lockTargetWhilePressed) {
-                                config.tapTarget.setPointerCapture(e.pointerId);
+                                try { config.tapTarget.setPointerCapture(e.pointerId); } catch (err) { /* capture unavailable */ }
                         } else {
-                                config.tapTarget.releasePointerCapture(e.pointerId);
+                                try { config.tapTarget.releasePointerCapture(e.pointerId); } catch (err) { /* no capture — fine */ }
                         }
 
                         callback(true, 0, 0);

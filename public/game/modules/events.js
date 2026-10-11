@@ -1024,6 +1024,21 @@ var _emscripten_set_main_loop = (func, fps, simulateInfiniteLoop) => {
     setMainLoop(iterFunc, fps, simulateInfiniteLoop)
 };
 var fillMouseEventData = (eventStruct, e, target) => {
+    // opt-in debug hook (zero cost unless enabled from the console):
+    // window.__vcMouseLog = [] then inspect what the engine actually receives
+    if (typeof window != "undefined" && (window.__vcMouseLog)) {
+        try {
+            if (window.__vcMouseLog.length < 400) {
+                window.__vcMouseLog.push({
+                    type: e.type,
+                    x: e.clientX, y: e.clientY,
+                    mx: e.movementX, my: e.movementY,
+                    target: (target && (target.id || target.tagName)) || "?",
+                    trusted: e.isTrusted
+                })
+            }
+        } catch (_) {}
+    }
     HEAPF64[eventStruct >> 3] = e.timeStamp;
     var idx = eventStruct >> 2;
     HEAP32[idx + 2] = e.screenX;

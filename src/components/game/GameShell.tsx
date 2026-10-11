@@ -315,6 +315,25 @@ export default function GameShell() {
         <div className="touch-control horn" />
         <div className="touch-control fireRight" />
         <div className="touch-control fireLeft" />
+        {/* Dedicated FIRE button (crosshair) — always shown while armed on
+            foot / in a weaponised vehicle. Bound to gamepad button 1 (fire),
+            same action as the fist button, but discoverable at a glance. */}
+        <div className="touch-control fire" />
+      </div>
+
+      {/* Portrait-block overlay: while the game runs on a phone held in
+          portrait, the auto-landscape attempt (fullscreen + orientation
+          lock) failed or is unsupported (iOS) — guide the player to rotate.
+          The "continue anyway" button sets data-rotate-skip on body. */}
+      <div className="rotate-block" aria-hidden>
+        <div className="rotate-block-inner">
+          <div className="rotate-block-icon" />
+          <div className="rotate-block-title">请横屏游玩</div>
+          <div className="rotate-block-sub">已尝试自动切换横屏，请旋转手机获得最佳体验</div>
+          <button className="rotate-block-skip" id="rotate-block-skip" type="button">
+            仍要竖屏继续
+          </button>
+        </div>
       </div>
     </>
   )

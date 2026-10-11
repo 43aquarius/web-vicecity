@@ -30,6 +30,19 @@ let isTouch = coarsePointer || (isMobile && navigator.maxTouchPoints > 0);
 
 document.body.dataset.isTouch = isTouch ? 1 : 0;
 
+// Camera-look touch sensitivity, 1 (heavy) – 10 (twitchy). URL param
+// look_sens wins, then localStorage, default 7 (≈ 76 px drag for full
+// deflection — noticeably snappier than the upstream 100 px, which players
+// reported as "hard to move the camera"). dragDistance = 160 − 12 × sens,
+// so sens 5 reproduces the original 100 px feel.
+let lookSens = parseInt(params.get('look_sens'), 10);
+if (!(lookSens >= 1 && lookSens <= 10)) {
+    lookSens = parseInt(localStorage.getItem('vcsky.lookSens'), 10);
+    if (!(lookSens >= 1 && lookSens <= 10)) lookSens = 7;
+}
+try { localStorage.setItem('vcsky.lookSens', String(lookSens)); } catch (e) { /* private mode */ }
+const lookDragDistance = Math.round(160 - lookSens * 12);
+
 const dataSize = 130 * 1024 * 1024;
 const textDecoder = new TextDecoder();
 let haveOriginalGame = false;
@@ -64,7 +77,7 @@ const translations = {
         loadWasmTitle: "Downloading engine core",
         loadEngineTitle: "Starting the engine",
         loadEngineHint: "The first start compiles the engine — this may take up to a minute.",
-        touchHint: "Touch controls: the FIST button (bottom-right) is also the FIRE button — punch when bare-handed, shoot when armed.",
+        touchHint: "Touch controls: the FIST button (bottom-right) is also the FIRE button — punch when bare-handed, shoot when armed. A red crosshair FIRE button appears next to JUMP whenever you are armed. Look: press and drag anywhere on the right half of the screen; keep sliding to keep rotating.",
         loadEngineSlow: "The engine is taking longer than usual. If nothing happens for a while, reload the page to retry.",
         loadErrorTitle: "Load failed",
         loadRetry: "Retry",
@@ -114,7 +127,7 @@ const translations = {
         loadWasmTitle: "Загрузка ядра движка",
         loadEngineTitle: "Запуск движка",
         loadEngineHint: "Первый запуск компилирует движок — это может занять до минуты.",
-        touchHint: "Сенсорное управление: кнопка с кулаком (справа внизу) — это и кнопка ОГОНЬ: удар кулаком или выстрел.",
+        touchHint: "Сенсорное управление: кнопка с кулаком — это и кнопка ОГОНЬ: удар кулаком или выстрел. При оружии рядом с кнопкой прыжка появляется красная кнопка огня (перекрестие). Обзор: удерживайте и ведите палец по правой половине экрана.",
         loadEngineSlow: "Запуск занимает больше обычного. Если ничего не происходит, обновите страницу.",
         loadErrorTitle: "Ошибка загрузки",
         loadRetry: "Повторить",
@@ -173,7 +186,7 @@ const translations = {
         loadWasmTitle: "正在下载引擎核心",
         loadEngineTitle: "正在启动游戏引擎",
         loadEngineHint: "首次启动需要编译引擎，可能需要一分钟左右。",
-        touchHint: "触屏操作：右下角的拳头按钮就是开火键——空手时出拳，持枪时射击。",
+        touchHint: "触屏操作：持枪时跳跃键旁会出现红色准星开火键（拳头键同样可开火）。视角：按住右半屏拖动即可转动镜头，手指可沿方向持续滑动。",
         loadEngineSlow: "启动耗时比预期久；若长时间无响应，可刷新页面重试。",
         loadErrorTitle: "加载失败",
         loadRetry: "重试",
@@ -452,8 +465,14 @@ async function downloadStreamed(url, onProgress) {
 // downloading" from "stuck". This overlay renders an unmissable neon progress
 // card covering every phase of the boot pipeline, and never hides without the
 // game being up or a clear error (with a retry button) being shown.
+//
+// Real-progress guarantee: every phase reports a concrete number whenever the
+// underlying source has one — server-side warm-up %, downloaded MB + speed +
+// ETA, wasm MB, Emscripten "Preparing (x/y)" — plus a 5-segment pipeline bar
+// (准备 → 连接 → 下载 → 引擎核 → 启动) and a % readout inside the bar. Only
+// truly opaque waits (TCP connect, wasm compile) stay indeterminate.
 const LoadingUI = (() => {
-    let root, titleEl, phaseEl, fill, statsEl, hintEl, retryBtn;
+    let root, titleEl, phaseEl, fill, pctEl, statsEl, hintEl, retryBtn, stepsEl;
     let visible = false;
     let engineMode = false;
     let samples = []; // {t, b} speed samples
@@ -467,6 +486,7 @@ const LoadingUI = (() => {
         wasm: ['loadWasmTitle', ''],
         engine: ['loadEngineTitle', 'loadEngineHint'],
     };
+    const PHASE_ORDER = ['warm', 'connect', 'download', 'wasm', 'engine'];
 
     const STYLE = `
 #vc-loading { position: fixed; inset: 0; z-index: 2147483000; display: flex; align-items: center; justify-content: center;
@@ -481,12 +501,21 @@ const LoadingUI = (() => {
   -webkit-backdrop-filter: blur(6px); backdrop-filter: blur(6px); }
 #vc-loading .vc-loading-brand { font-size: clamp(10px, 2.4vmin, 13px); font-weight: 700; letter-spacing: .55em; text-indent: .55em;
   color: #ff4193; text-shadow: 0 0 14px rgba(255,65,147,.65); margin-bottom: 10px; text-transform: uppercase; }
+#vc-loading .vc-loading-steps { display: flex; gap: 5px; width: 86%; margin: 0 auto 18px; }
+#vc-loading .vc-step { flex: 1; height: 4px; border-radius: 2px; background: rgba(255,255,255,.14);
+  transition: background .3s, box-shadow .3s; }
+#vc-loading .vc-step.done { background: #ff4193; box-shadow: 0 0 8px rgba(255,65,147,.55); }
+#vc-loading .vc-step.active { background: #ffffc0; box-shadow: 0 0 10px rgba(255,255,192,.7); animation: vc-pulse 1.1s ease-in-out infinite; }
+@keyframes vc-pulse { 50% { opacity: .45; } }
 #vc-loading .vc-loading-title { font-size: clamp(17px, 4.2vmin, 25px); font-weight: 700; color: #fff;
   text-shadow: 0 0 20px rgba(255,255,192,.28); margin-bottom: 20px; line-height: 1.35; }
 #vc-loading.vc-err .vc-loading-title { color: #ff6b81; text-shadow: 0 0 18px rgba(255,107,129,.45); }
 #vc-loading .vc-loading-bar { position: relative; height: 15px; border-radius: 9px; overflow: hidden;
   border: 2px solid rgba(255,255,192,.55); background: rgba(255,255,255,.08);
   box-shadow: 0 0 16px rgba(255,255,192,.28), inset 0 0 7px rgba(0,0,0,.55); }
+#vc-loading .vc-loading-pct { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 10.5px; font-weight: 700; color: #fff; letter-spacing: .06em; pointer-events: none;
+  text-shadow: 0 1px 3px rgba(0,0,0,.85), 0 0 8px rgba(0,0,0,.6); }
 #vc-loading .vc-loading-fill { height: 100%; width: 0%; border-radius: 6px; position: absolute; top: 0; left: 0;
   background: linear-gradient(90deg, #ffffc0, #ff4193); box-shadow: 0 0 14px rgba(255,65,147,.75);
   transition: width .25s ease, left .25s ease; }
@@ -520,8 +549,11 @@ const LoadingUI = (() => {
         root.innerHTML = `
             <div class="vc-loading-card">
                 <div class="vc-loading-brand">Vice City</div>
+                <div class="vc-loading-steps" id="vc-loading-steps">
+                    <span class="vc-step"></span><span class="vc-step"></span><span class="vc-step"></span><span class="vc-step"></span><span class="vc-step"></span>
+                </div>
                 <div class="vc-loading-title" id="vc-loading-phase"></div>
-                <div class="vc-loading-bar"><div class="vc-loading-fill" id="vc-loading-fill"></div></div>
+                <div class="vc-loading-bar"><div class="vc-loading-fill" id="vc-loading-fill"></div><div class="vc-loading-pct" id="vc-loading-pct"></div></div>
                 <div class="vc-loading-stats" id="vc-loading-stats"></div>
                 <div class="vc-loading-hint" id="vc-loading-hint"></div>
                 <button class="vc-loading-retry" id="vc-loading-retry" type="button"></button>
@@ -529,8 +561,10 @@ const LoadingUI = (() => {
         document.body.appendChild(root);
         phaseEl = root.querySelector('#vc-loading-phase');
         fill = root.querySelector('#vc-loading-fill');
+        pctEl = root.querySelector('#vc-loading-pct');
         statsEl = root.querySelector('#vc-loading-stats');
         hintEl = root.querySelector('#vc-loading-hint');
+        stepsEl = root.querySelector('#vc-loading-steps');
         retryBtn = root.querySelector('#vc-loading-retry');
         retryBtn.textContent = t('loadRetry');
         retryBtn.addEventListener('click', () => {
@@ -564,7 +598,17 @@ const LoadingUI = (() => {
         if (!visible) show();
         engineMode = name === 'engine';
         samples = [];
-        phaseEl.textContent = t(keys[0]);
+        // Pipeline step indicator: mark completed/active segments and
+        // append "· x/5" to the phase title so the overall position in the
+        // boot pipeline is always visible.
+        const idx = PHASE_ORDER.indexOf(name);
+        if (stepsEl && idx >= 0) {
+            const segs = stepsEl.children;
+            for (let i = 0; i < segs.length; i++) {
+                segs[i].className = 'vc-step' + (i < idx ? ' done' : i === idx ? ' active' : '');
+            }
+        }
+        phaseEl.textContent = idx >= 0 ? (t(keys[0]) + ' · ' + (idx + 1) + '/5') : t(keys[0]);
         hintEl.textContent = keys[1] ? t(keys[1]) : '';
         // On touch devices append the control mapping hint during the engine
         // phase (read right before the game appears): many players never
@@ -573,9 +617,7 @@ const LoadingUI = (() => {
             hintEl.textContent = (hintEl.textContent ? hintEl.textContent + ' ' : '') + t('touchHint');
         }
         statsEl.textContent = '';
-        fill.classList.add('indet');
-        fill.style.width = '38%';
-        fill.style.left = '';
+        setFill(null);
         root.classList.remove('vc-err');
         if (engineMode) {
             // Long-boot hint: the engine can legitimately take ~a minute on
@@ -584,6 +626,23 @@ const LoadingUI = (() => {
             engineWatchdog = setTimeout(() => {
                 if (visible && engineMode) hintEl.textContent = t('loadEngineSlow');
             }, 90000);
+        }
+    }
+
+    // Set the progress bar: null = indeterminate (opaque wait), otherwise a
+    // 0–100 percentage also mirrored into the in-bar % readout.
+    function setFill(pct) {
+        if (pct == null || !isFinite(pct)) {
+            fill.classList.add('indet');
+            fill.style.width = '38%';
+            fill.style.left = '';
+            if (pctEl) pctEl.textContent = '';
+        } else {
+            const clamped = Math.min(100, Math.max(0, pct));
+            fill.classList.remove('indet');
+            fill.style.width = clamped.toFixed(1) + '%';
+            fill.style.left = '';
+            if (pctEl) pctEl.textContent = clamped >= 4 ? Math.floor(clamped) + '%' : '';
         }
     }
 
@@ -615,10 +674,9 @@ const LoadingUI = (() => {
         if (!visible) show();
         if (typeof total === 'number' && total > 0) {
             const pct = Math.min(100, (current / total) * 100);
-            fill.classList.remove('indet');
-            fill.style.width = pct.toFixed(1) + '%';
+            setFill(pct);
             const spd = speedNow(current);
-            const parts = [fmtMB(current) + ' / ' + fmtMB(total)];
+            const parts = [Math.floor(pct) + '% · ' + fmtMB(current) + ' / ' + fmtMB(total)];
             if (spd > 0.01) {
                 parts.push(spd.toFixed(1) + ' ' + t('loadSpeed'));
                 const eta = (total - current) / 1048576 / spd;
@@ -627,12 +685,20 @@ const LoadingUI = (() => {
             }
             statsEl.textContent = parts.join('  ·  ');
         } else {
-            fill.classList.add('indet');
+            setFill(null);
             const spd = speedNow(current);
             statsEl.textContent = spd > 0.01
                 ? fmtMB(current) + '  ·  ' + spd.toFixed(1) + ' ' + t('loadSpeed')
                 : fmtMB(current);
         }
+    }
+
+    // Percent-only progress (server-side warm-up / archive download report
+    // a 0–100 number with no byte counts). Keeps the stats line untouched —
+    // callers pass their own label via stats().
+    function progressPct(pct) {
+        if (!visible) show();
+        setFill(Math.min(99.5, Math.max(0, pct)));
     }
 
     function stats(text) { if (!visible) show(); statsEl.textContent = text; }
@@ -648,7 +714,28 @@ const LoadingUI = (() => {
 
     function engineStatus(text) {
         if (!visible || !engineMode) return;
-        statsEl.textContent = text;
+        // Emscripten reports dependency progress as "Preparing... (x/y)" —
+        // surface it on the bar as a real percentage instead of bare text.
+        const m = text && text.match(/(\d+)\s*\/\s*(\d+)/);
+        if (m) {
+            const cur = Number(m[1]);
+            const tot = Number(m[2]);
+            if (tot > 0 && cur >= 0 && cur <= tot) {
+                const pct = (cur / tot) * 100;
+                setFill(pct);
+                statsEl.textContent = text + ' · ' + Math.floor(pct) + '%';
+                return;
+            }
+        }
+        statsEl.textContent = text || '';
+    }
+
+    // Engine main() is alive — show 100% briefly before the overlay retires.
+    function engineDone() {
+        if (!visible || !engineMode) return;
+        setFill(100);
+        if (pctEl) pctEl.textContent = '100%';
+        statsEl.textContent = currentLanguage === 'zh' ? '引擎已就绪，即将进入游戏' : 'Engine ready';
     }
 
     function engineReady() {
@@ -668,7 +755,7 @@ const LoadingUI = (() => {
         statsEl.textContent = msg ? msg.slice(0, 160) : '';
     }
 
-    return { show, hide, phase, progress, stats, hint, retrying, stall, engineStatus, engineReady, error };
+    return { show, hide, phase, progress, progressPct, stats, hint, retrying, stall, engineStatus, engineReady, engineDone, error };
 })();
 
 /**
@@ -699,9 +786,11 @@ async function waitForServerData() {
         }
 
         if (st.state === 'downloading' || st.state === 'indexing') {
-            const pct = st.state === 'indexing' ? 100 : (st.progress || 0);
+            const pct = st.state === 'indexing' ? 99.5 : Math.min(99.5, st.progress || 0);
             LoadingUI.phase('warm');
-            LoadingUI.stats(t('serverPreparing').replace('%1%', String(pct)));
+            // Real server-side progress on the bar (0–100 from the status API).
+            LoadingUI.progressPct(pct);
+            LoadingUI.stats(t('serverPreparing').replace('%1%', String(Math.floor(pct))));
             await sleep(1500);
             continue;
         }
@@ -737,9 +826,13 @@ async function waitForServerData() {
                 LoadingUI.progress(w.received, w.total);
             } else if (w.phase === 'decompressing') {
                 LoadingUI.phase('warm');
+                // Decompress is the last warm step before "done": show it as
+                // near-complete rather than an empty indeterminate bar.
+                LoadingUI.progressPct(96);
                 LoadingUI.stats(t('loadDecompress'));
             } else { // pending
                 LoadingUI.phase('warm');
+                LoadingUI.progressPct(2);
             }
             await sleep(1000);
             continue;
@@ -909,7 +1002,8 @@ async function loadGame(data) {
                 console.error('mainCalled error:', e);
             }
             // Engine main() is alive — first frames render within seconds;
-            // retire the loading overlay then.
+            // flash 100% on the overlay, then retire it.
+            LoadingUI.engineDone();
             setTimeout(() => LoadingUI.hide(), 2500);
         },
         syncRevcIni: () => {
@@ -1046,7 +1140,11 @@ async function loadGame(data) {
     emulator.AddDisplayJoystickEventListeners(0, [gamepadEmulatorConfig]);
     const gamepadEmulatorConfig1 = {
         directions: { up: true, down: true, left: true, right: true },
-        dragDistance: 100,
+        // Camera look: sensitivity-tuned drag distance (lookDragDistance
+        // below) + followDrag so the finger can keep sliding past the
+        // saturation radius to rotate continuously without re-touching.
+        dragDistance: lookDragDistance,
+        followDrag: true,
         tapTarget: look,
         lockTargetWhilePressed: true,
         xAxisIndex: 2,
@@ -1056,6 +1154,58 @@ async function loadGame(data) {
         invertY: false,
     };
     emulator.AddDisplayJoystickEventListeners(0, [gamepadEmulatorConfig1]);
+
+    // ------------------------------------------------------------------
+    // On-foot camera mode fix: in this engine the RIGHT STICK on foot is
+    // bound to PED_1RST_PERSON_LOOK_* (VC's first-person look mode), so a
+    // touch camera drag used to dive the camera into the player's head —
+    // "the view switched from 3rd to 1st person". Route on-foot camera
+    // drags to PC-style MOUSE movement instead: reVC orbits the camera
+    // behind the player (3rd person), exactly like the desktop controls.
+    // Vehicles / aiming scopes keep the stick path (turret + aim look).
+    // ------------------------------------------------------------------
+    const LOOK_MOUSE_GAIN = 12;   // px of look injected per move event at
+    const LOOK_MOUSE_GAIN_Y = 0.7; // full deflection (horizontal / vertical)
+    const lookMouseActive = () => {
+        const ds = document.body.dataset;
+        return ds.stateCar !== '1'
+            && ds.stateMenu !== '1'
+            && ds.stateCutscene !== '1'
+            && ds.stateScopeMode !== '1'
+            && ds.stateScopeGun !== '1'
+            && ds.stateDisableControls !== '1'
+            && ds.stateDownload !== '1';
+    };
+    const injectLookMouse = (dx, dy) => {
+        // Synthetic mousemove carrying EXACT movementX/Y, dispatched at the
+        // CANVAS: the engine (Emscripten mousemove callback) listens on the
+        // canvas element only — body/document dispatches never reach it.
+        // fillMouseEventData passes e.movementX/Y straight into the engine,
+        // immune to the coordinate-differencing that compatibility mouse
+        // events would otherwise cause.
+        const ev = new MouseEvent('mousemove', {
+            bubbles: true,
+            cancelable: true,
+            clientX: Math.round(innerWidth / 2),
+            clientY: Math.round(innerHeight / 2),
+            movementX: Math.round(dx),
+            movementY: Math.round(dy),
+        });
+        (document.getElementById('canvas') || document.body).dispatchEvent(ev);
+    };
+    const origMoveAxis = emulator.MoveAxis.bind(emulator);
+    emulator.MoveAxis = (gamepadIndex, axisIndex, value) => {
+        const isLookAxis = axisIndex === 2 || axisIndex === 3;
+        if (isLookAxis && lookMouseActive()) {
+            const dx = axisIndex === 2 ? value * LOOK_MOUSE_GAIN : 0;
+            const dy = axisIndex === 3 ? value * LOOK_MOUSE_GAIN * LOOK_MOUSE_GAIN_Y : 0;
+            injectLookMouse(dx, dy);
+            // keep the virtual right stick neutral on foot so the engine's
+            // first-person look never engages from a camera drag
+            return origMoveAxis(gamepadIndex, axisIndex, 0);
+        }
+        return origMoveAxis(gamepadIndex, axisIndex, value);
+    };
 
     emulator.AddDisplayButtonEventListeners(0, [{
         buttonIndex: 9,
@@ -1076,6 +1226,15 @@ async function loadGame(data) {
         buttonIndex: 1,
         lockTargetWhilePressed: false,
         tapTarget: document.querySelector('.touch-control.fist'),
+    }]);
+    // Dedicated FIRE button (red crosshair, visible while armed): same
+    // gamepad button 1 as the fist button, so it fires whichever weapon is
+    // currently held — bare hands punch, firearms shoot, in-car weapons
+    // do drive-by. Positioned next to jump on the bottom action row.
+    emulator.AddDisplayButtonEventListeners(0, [{
+        buttonIndex: 1,
+        lockTargetWhilePressed: false,
+        tapTarget: document.querySelector('.touch-control.fire'),
     }]);
     emulator.AddDisplayButtonEventListeners(0, [{
         buttonIndex: 5,
@@ -1133,6 +1292,39 @@ async function loadGame(data) {
 
 const clickToPlay = document.querySelector('.click-to-play');
 const clickLink = clickToPlay.querySelector('button');
+
+// Auto-landscape for phones: request fullscreen + lock orientation to
+// landscape. MUST be called synchronously inside the click handler — both
+// APIs require user activation. Android Chrome honours the lock; iOS Safari
+// has no orientation.lock (and iPhone Safari no fullscreen either), so the
+// CSS .rotate-block overlay ("请横屏游玩") takes over guidance there.
+async function tryAutoLandscape() {
+    try {
+        if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+            await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+        }
+    } catch (err) {
+        console.warn('[landscape] fullscreen request failed:', err && err.message);
+    }
+    try {
+        if (screen.orientation && typeof screen.orientation.lock === 'function') {
+            await screen.orientation.lock('landscape');
+        }
+    } catch (err) {
+        // Not supported (iOS) or refused — the portrait rotate-block overlay
+        // in CSS covers this case; nothing else to do here.
+        console.info('[landscape] orientation lock unavailable:', err && err.message);
+    }
+}
+
+// "仍要竖屏继续" — dismiss the portrait rotate-block overlay for this session.
+const rotateSkipBtn = document.getElementById('rotate-block-skip');
+if (rotateSkipBtn) {
+    rotateSkipBtn.addEventListener('click', () => {
+        document.body.setAttribute('data-rotate-skip', '1');
+    });
+}
+
 clickToPlay.addEventListener('click', (e) => {
     if (!haveOriginalGame) {
         //     alert(t('demoAlert'));
@@ -1140,6 +1332,11 @@ clickToPlay.addEventListener('click', (e) => {
         return;
     }
     if (e.target === clickToPlay || e.target === clickLink) {
+        if (isTouch || isMobile) {
+            // Fire-and-forget (async, still entered within the user gesture):
+            // auto-rotate phones to landscape before the game boots.
+            tryAutoLandscape();
+        }
         startGame(e);
         if (!isMobile && autoFullScreen) {
             if (window.top === window) {
@@ -1355,7 +1552,7 @@ HorizantalMouseSens=0.002500
 InvertMouseVertically=1
 DisableMouseSteering=1
 Vibration=0
-Method=${isTouch ? '1' : '0'}
+Method=0
 InvertPad=0
 JoystickName=
 PadButtonsInited=0
@@ -1463,6 +1660,18 @@ UNKNOWN_ACTION=
 const revc_ini = (() => {
     const cached = localStorage.getItem('vcsky.revc.ini');
     if (cached) {
+        // Migration: Method=1 (classic pad) disables the PC mouse camera —
+        // the mechanism the mobile view-drag fix depends on (drags inject
+        // mouse movement; in classic mode the engine ignores mouse-look on
+        // foot and the right stick dives into first person). The virtual
+        // gamepad's 2nd-keyboard bindings keep ALL touch buttons working in
+        // Method=0 (verified: menu, punch, walk, jump). Force the migration
+        // for players who booted before this fix.
+        if (/^Method=1$/m.test(cached)) {
+            const patched = cached.replace(/^Method=1$/m, 'Method=0');
+            try { localStorage.setItem('vcsky.revc.ini', patched); } catch (e) { /* private mode */ }
+            return patched;
+        }
         return cached;
     }
     return revc_iniDefault;
