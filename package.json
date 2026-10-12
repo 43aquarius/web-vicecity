@@ -2,7 +2,7 @@
   "name": "web-vicecity-relay-b",
   "version": "1.0.0",
   "private": true,
-  "description": "web-vicecity archive relay B — serves archive partition [361454906, 722909812) with CORS Range support",
+  "description": "web-vicecity archive relay b \u2014 serves archive partition [361454906, 542182359) with CORS Range support",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

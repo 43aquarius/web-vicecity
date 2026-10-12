@@ -1,7 +1,7 @@
 FROM node:20-alpine
 WORKDIR /app
 COPY server.js config.json package.json ./
-# 分区数据放卷 /app/data（≈361 MB）
+# 分区数据放卷 /app/data（≈172.4 MB）
 VOLUME /app/data
 EXPOSE 8787
 # 首次启动自动播种；healthcheck 顺带校验就绪状态
