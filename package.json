@@ -1,0 +1,15 @@
+{
+  "name": "web-vicecity-relay-d",
+  "version": "1.0.0",
+  "private": true,
+  "description": "web-vicecity archive relay d \u2014 serves archive partition [987212548, 1084364719) with CORS Range support",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "seed": "node server.js --seed",
+    "status": "node server.js --status"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
